@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.2.0
+version: 1.3.0
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -467,6 +467,12 @@ class Memory(BaseModel):
         None,
         description="Similarity score (0 to 1 - higher is **more similar** to user query) if available",
     )
+    clarity: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Memory clarity (0.0-1.0). 1.0 = perfectly clear, 0.0 = completely vague. decays over time if not accessed.",
+    )
 
 
 def build_actions_request_model(existing_ids: list[str]):
@@ -546,12 +552,16 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
             if distances_batch is not None and doc_idx < len(distances_batch):
                 similarity_score = round(distances_batch[doc_idx], 3)
 
+            # Extract clarity from metadata (default to 1.0 for legacy memories)
+            clarity = float(meta.get("clarity", 1.0))
+
             mem = Memory(
                 mem_id=mem_id,
                 created_at=created_at,
                 update_at=updated_at,
                 content=content,
                 similarity_score=similarity_score,
+                clarity=clarity,
             )
             memories.append(mem)
 
@@ -615,6 +625,36 @@ class Filter:
         debug_mode: bool = Field(
             default=False,
             description="enable debug logging",
+        )
+
+        # ===== Memory Decay (Forgetting Mechanism) =====
+        enable_memory_decay: bool = Field(
+            default=False,
+            description="enable automatic memory decay (forgetting mechanism). memories will fade over time if not accessed.",
+        )
+        initial_clarity: float = Field(
+            default=1.0,
+            ge=0.0,
+            le=1.0,
+            description="initial clarity for new memories (0.0-1.0). 1.0 = perfectly clear, 0.0 = completely vague.",
+        )
+        clarity_threshold: float = Field(
+            default=0.2,
+            ge=0.0,
+            le=1.0,
+            description="memories with clarity below this threshold will be auto-deleted (0.0-1.0). recommended: 0.15-0.3.",
+        )
+        decay_rate: float = Field(
+            default=0.05,
+            ge=0.0,
+            le=1.0,
+            description="exponential decay rate λ (0.0-1.0). higher = faster forgetting. 0.05 ≈ 50% clarity after 2 weeks, 0.1 ≈ 50% after 1 week.",
+        )
+        boost_factor: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="clarity boost when memory is retrieved (0.0-1.0). higher = stronger reinforcement when memory is accessed.",
         )
 
     class UserValves(BaseModel):
@@ -1129,6 +1169,346 @@ class Filter:
 
         return related_memories
 
+    @staticmethod
+    def boost_memory_clarity(
+        current_clarity: float,
+        boost_factor: float,
+    ) -> float:
+        """
+        Boost memory clarity when it is retrieved/accessed.
+
+        Args:
+            current_clarity: Current clarity value [0.0, 1.0]
+            boost_factor: Boost coefficient [0.0, 1.0]
+
+        Returns:
+            New clarity value [0.0, 1.0]
+
+        Algorithm:
+            clarity_boost = boost_factor × (1 - current_clarity)
+            new_clarity = min(1.0, current_clarity + clarity_boost)
+
+        Design rationale:
+            - Vaguer memories get more boost
+            - Already-clear memories have less room to improve
+            - Ensures clarity never exceeds 1.0
+        """
+        if not 0.0 <= current_clarity <= 1.0:
+            raise ValueError(
+                f"clarity must be in [0.0, 1.0], got {current_clarity}"
+            )
+        if not 0.0 <= boost_factor <= 1.0:
+            raise ValueError(
+                f"boost_factor must be in [0.0, 1.0], got {boost_factor}"
+            )
+
+        clarity_boost = boost_factor * (1.0 - current_clarity)
+        new_clarity = min(1.0, current_clarity + clarity_boost)
+
+        return round(new_clarity, 4)
+
+    @staticmethod
+    def decay_memory_clarity(
+        current_clarity: float,
+        last_update_timestamp: int,
+        now_timestamp: int,
+        decay_rate: float,
+    ) -> float:
+        """
+        Calculate decayed clarity based on exponential decay model.
+
+        Args:
+            current_clarity: Current clarity value [0.0, 1.0]
+            last_update_timestamp: Last update time (Unix timestamp, seconds)
+            now_timestamp: Current time (Unix timestamp, seconds)
+            decay_rate: Decay rate λ, recommended range [0.01, 0.2]
+                       - 0.05: ~50% after 2 weeks
+                       - 0.1: ~50% after 1 week
+
+        Returns:
+            Decayed clarity value [0.0, 1.0]
+
+        Algorithm:
+            Δt_days = (now - last_update) / 86400
+            new_clarity = current_clarity × e^(-decay_rate × Δt_days)
+
+        Design rationale:
+            - Follows Ebbinghaus forgetting curve
+            - Older memories decay more
+            - Already-low clarity approaches zero asymptotically
+        """
+        import math
+
+        if not 0.0 <= current_clarity <= 1.0:
+            raise ValueError(
+                f"clarity must be in [0.0, 1.0], got {current_clarity}"
+            )
+        if last_update_timestamp > now_timestamp:
+            raise ValueError("last_update cannot be in the future")
+        if decay_rate < 0:
+            raise ValueError(f"decay_rate must be >= 0, got {decay_rate}")
+
+        # Calculate time delta in days
+        delta_seconds = now_timestamp - last_update_timestamp
+        delta_days = delta_seconds / 86400.0
+
+        # Exponential decay formula
+        new_clarity = current_clarity * math.exp(-decay_rate * delta_days)
+
+        # Ensure within valid range
+        new_clarity = max(0.0, min(1.0, new_clarity))
+
+        return round(new_clarity, 4)
+
+    async def process_memory_decay(
+        self,
+        user: UserModel,
+    ) -> dict[str, int]:
+        """
+        Process decay for all user memories and delete those below threshold.
+
+        Workflow:
+            1. Fetch all memories from vector database
+            2. Calculate new clarity for each (based on time decay)
+            3. Delete memories with clarity < threshold
+            4. Batch update remaining memories with new clarity
+
+        Returns:
+            Statistics dict:
+            {
+                "total": total memory count,
+                "decayed": number of memories that decayed,
+                "deleted": number of memories deleted,
+                "updated": number of memories updated
+            }
+        """
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+        import time
+
+        collection_name = f"user-memory-{user.id}"
+
+        # 1. Get all memories
+        try:
+            result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+            if not result or not result.ids:
+                self.log("no memories found for decay processing", level="debug")
+                return {"total": 0, "decayed": 0, "deleted": 0, "updated": 0}
+        except Exception as e:
+            self.log(f"failed to get memories for decay: {e}", level="error")
+            return {"total": 0, "decayed": 0, "deleted": 0, "updated": 0}
+
+        # 2. Parse memory data
+        ids_batch = result.ids[0]
+        documents_batch = result.documents[0]
+        metadatas_batch = result.metadatas[0]
+
+        now_timestamp = int(time.time())
+        to_delete = []
+        to_update = []
+
+        stats = {"total": len(ids_batch), "decayed": 0, "deleted": 0, "updated": 0}
+
+        # 3. Process each memory
+        for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
+            # Get current clarity (default to initial_clarity for legacy memories)
+            current_clarity = float(meta.get("clarity", self.valves.initial_clarity))
+            last_update = int(meta.get("updated_at", meta.get("created_at", now_timestamp)))
+
+            # Calculate decayed clarity
+            new_clarity = self.decay_memory_clarity(
+                current_clarity=current_clarity,
+                last_update_timestamp=last_update,
+                now_timestamp=now_timestamp,
+                decay_rate=self.valves.decay_rate,
+            )
+
+            # Decide: delete or update
+            if new_clarity < self.valves.clarity_threshold:
+                to_delete.append(mem_id)
+                stats["deleted"] += 1
+            elif new_clarity != current_clarity:  # Only update if changed
+                meta["clarity"] = new_clarity
+                to_update.append({
+                    "id": mem_id,
+                    "text": content,
+                    "metadata": meta,
+                })
+                stats["decayed"] += 1
+
+        # 4. Execute deletions
+        if to_delete:
+            try:
+                VECTOR_DB_CLIENT.delete(collection_name=collection_name, ids=to_delete)
+                self.log(
+                    f"deleted {len(to_delete)} memories due to low clarity",
+                    level="info"
+                )
+            except Exception as e:
+                self.log(f"failed to delete memories: {e}", level="error")
+
+        # 5. Batch update (requires re-generating vectors)
+        if to_update:
+            try:
+                # Re-generate vectors for updated memories
+                from open_webui.main import app as webui_app
+
+                for item in to_update:
+                    vector = await webui_app.state.EMBEDDING_FUNCTION(
+                        item["text"], user=user
+                    )
+                    item["vector"] = vector
+
+                # Upsert with updated metadata
+                from open_webui.retrieval.vector.main import VectorItem
+                VECTOR_DB_CLIENT.upsert(
+                    collection_name=collection_name,
+                    items=[VectorItem(**item) for item in to_update],
+                )
+                stats["updated"] = len(to_update)
+                self.log(
+                    f"updated clarity for {len(to_update)} memories",
+                    level="info"
+                )
+            except Exception as e:
+                self.log(f"failed to update memories: {e}", level="error")
+
+        return stats
+
+    async def boost_retrieved_memories(
+        self,
+        retrieved_memories: list[Memory],
+        user: UserModel,
+    ) -> None:
+        """
+        Boost clarity for memories that were just retrieved.
+
+        Args:
+            retrieved_memories: List of Memory objects that were retrieved
+            user: User model
+
+        Side effects:
+            Updates clarity in vector database for retrieved memories
+        """
+        if not retrieved_memories:
+            return
+
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+        from open_webui.retrieval.vector.main import VectorItem
+        from open_webui.main import app as webui_app
+        import time
+
+        collection_name = f"user-memory-{user.id}"
+        to_update = []
+
+        for mem in retrieved_memories:
+            new_clarity = self.boost_memory_clarity(
+                current_clarity=mem.clarity,
+                boost_factor=self.valves.boost_factor,
+            )
+
+            # Only update if clarity actually increased
+            if new_clarity > mem.clarity:
+                to_update.append({
+                    "id": mem.mem_id,
+                    "text": mem.content,
+                    "metadata": {
+                        "created_at": int(mem.created_at.timestamp()),
+                        "updated_at": int(time.time()),  # Update timestamp
+                        "clarity": new_clarity,
+                    },
+                })
+                self.log(
+                    f"boosting memory {mem.mem_id[:8]}... clarity: {mem.clarity:.2f} → {new_clarity:.2f}",
+                    level="debug"
+                )
+
+        if to_update:
+            try:
+                # Re-generate vectors
+                for item in to_update:
+                    vector = await webui_app.state.EMBEDDING_FUNCTION(
+                        item["text"], user=user
+                    )
+                    item["vector"] = vector
+
+                # Upsert with boosted clarity
+                VECTOR_DB_CLIENT.upsert(
+                    collection_name=collection_name,
+                    items=[VectorItem(**item) for item in to_update],
+                )
+                self.log(
+                    f"boosted clarity for {len(to_update)} retrieved memories",
+                    level="info"
+                )
+            except Exception as e:
+                self.log(f"failed to boost memories: {e}", level="error")
+
+    async def _initialize_memory_clarity(
+        self,
+        memory_ids: list[str],
+        user: UserModel,
+    ) -> None:
+        """
+        Initialize clarity field for newly added memories.
+
+        Since Open WebUI's add_memory doesn't set clarity by default,
+        we need to update it manually after insertion.
+
+        Args:
+            memory_ids: List of newly added memory IDs
+            user: User model
+        """
+        if not memory_ids:
+            return
+
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+        from open_webui.retrieval.vector.main import VectorItem
+        from open_webui.main import app as webui_app
+
+        collection_name = f"user-memory-{user.id}"
+
+        try:
+            # Get the newly added memories
+            result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+            if not result or not result.ids:
+                return
+
+            ids_batch = result.ids[0]
+            documents_batch = result.documents[0]
+            metadatas_batch = result.metadatas[0]
+
+            to_update = []
+
+            for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
+                if mem_id in memory_ids:
+                    # Add clarity to metadata
+                    meta["clarity"] = self.valves.initial_clarity
+                    to_update.append({
+                        "id": mem_id,
+                        "text": content,
+                        "metadata": meta,
+                    })
+
+            if to_update:
+                # Re-generate vectors and upsert
+                for item in to_update:
+                    vector = await webui_app.state.EMBEDDING_FUNCTION(
+                        item["text"], user=user
+                    )
+                    item["vector"] = vector
+
+                VECTOR_DB_CLIENT.upsert(
+                    collection_name=collection_name,
+                    items=[VectorItem(**item) for item in to_update],
+                )
+                self.log(
+                    f"initialized clarity={self.valves.initial_clarity} for {len(to_update)} new memories",
+                    level="debug"
+                )
+
+        except Exception as e:
+            self.log(f"failed to initialize clarity for new memories: {e}", level="error")
+
     async def auto_memory(
         self,
         messages: list[dict[str, Any]],
@@ -1142,7 +1522,33 @@ class Filter:
             return
         self.log(f"flow started. user ID: {user.id}", level="debug")
 
+        # === Memory Decay Processing ===
+        if self.valves.enable_memory_decay:
+            self.log("processing memory decay", level="debug")
+            decay_stats = await self.process_memory_decay(user)
+            self.log(f"decay stats: {decay_stats}", level="info")
+
+            if decay_stats["deleted"] > 0 or decay_stats["decayed"] > 0:
+                decay_msg = []
+                if decay_stats["deleted"] > 0:
+                    decay_msg.append(f"deleted {decay_stats['deleted']} vague memories")
+                if decay_stats["decayed"] > 0:
+                    decay_msg.append(f"decayed {decay_stats['decayed']} memories")
+
+                if self.user_valves.show_status:
+                    await emit_status(
+                        f"memory decay: {', '.join(decay_msg)}",
+                        emitter=emitter,
+                        status="complete"
+                    )
+
+        # === Get Related Memories ===
         related_memories = await self.get_related_memories(messages=messages, user=user)
+
+        # === Boost Retrieved Memories ===
+        if self.valves.enable_memory_decay and related_memories:
+            self.log("boosting retrieved memories", level="debug")
+            await self.boost_retrieved_memories(related_memories, user)
 
         stringified_memories = json.dumps(
             [memory.model_dump(mode="json") for memory in related_memories]
@@ -1236,17 +1642,31 @@ class Filter:
 
         # Process all operations in order
         counts = {}
+        added_memory_ids = []  # Track newly added memory IDs for clarity initialization
+
         for op_name, op_config in operations.items():
             counts[op_name] = 0
             for action in op_config["actions"]:
                 if op_config["skip_empty"](action):
                     continue
                 try:
-                    await op_config["handler"](action)
+                    result = await op_config["handler"](action)
                     self.log(op_config["log_msg"](action))
                     counts[op_name] += 1
+
+                    # Track newly added memory IDs
+                    if op_name == "add" and result:
+                        added_memory_ids.append(result.id)
+
                 except Exception as e:
                     raise RuntimeError(op_config["error_msg"](action, e))
+
+        # Initialize clarity for newly added memories
+        if self.valves.enable_memory_decay and added_memory_ids:
+            await self._initialize_memory_clarity(
+                memory_ids=added_memory_ids,
+                user=user,
+            )
 
         # Build status message
         status_parts = []
