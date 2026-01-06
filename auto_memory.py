@@ -1267,9 +1267,14 @@ class Filter:
         """
         Process decay for all user memories and delete those below threshold.
 
+        Uses Ebbinghaus forgetting curve with reinforcement tracking:
+        - base_clarity: Clarity value at last reinforcement
+        - last_reinforcement: Timestamp of last reinforcement (creation or retrieval)
+        - Decay is calculated from base_clarity, not current_clarity (prevents compound decay)
+
         Workflow:
             1. Fetch all memories from vector database
-            2. Calculate new clarity for each (based on time decay)
+            2. Calculate new clarity for each (from base_clarity + last_reinforcement)
             3. Delete memories with clarity < threshold
             4. Batch update remaining memories with new clarity
 
@@ -1308,26 +1313,53 @@ class Filter:
 
         stats = {"total": len(ids_batch), "decayed": 0, "deleted": 0, "updated": 0}
 
+        self.log(
+            f"processing decay for {len(ids_batch)} memories (decay_rate={self.valves.decay_rate}, threshold={self.valves.clarity_threshold})",
+            level="debug"
+        )
+
         # 3. Process each memory
         for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
-            # Get current clarity (default to initial_clarity for legacy memories)
-            current_clarity = float(meta.get("clarity", self.valves.initial_clarity))
-            last_update = int(meta.get("updated_at", meta.get("created_at", now_timestamp)))
+            # Read reinforcement baseline (for legacy memories, initialize from current state)
+            base_clarity = float(meta.get("base_clarity", meta.get("clarity", self.valves.initial_clarity)))
+            last_reinforcement = int(meta.get("last_reinforcement", meta.get("created_at", now_timestamp)))
 
-            # Calculate decayed clarity
+            # Calculate time since last reinforcement
+            time_delta_seconds = now_timestamp - last_reinforcement
+            time_delta_days = time_delta_seconds / 86400.0
+
+            # Calculate decayed clarity from baseline (not from current clarity!)
             new_clarity = self.decay_memory_clarity(
-                current_clarity=current_clarity,
-                last_update_timestamp=last_update,
+                current_clarity=base_clarity,  # Key: use baseline, not current
+                last_update_timestamp=last_reinforcement,
                 now_timestamp=now_timestamp,
                 decay_rate=self.valves.decay_rate,
             )
+
+            # Debug logging for individual memory
+            if self.valves.debug_mode:
+                self.log(
+                    f"[decay] mem_id={mem_id[:8]}... | "
+                    f"base_clarity={base_clarity:.3f} | "
+                    f"days_since_reinforcement={time_delta_days:.1f} | "
+                    f"new_clarity={new_clarity:.3f} | "
+                    f"delta={new_clarity - base_clarity:.3f}",
+                    level="debug"
+                )
 
             # Decide: delete or update
             if new_clarity < self.valves.clarity_threshold:
                 to_delete.append(mem_id)
                 stats["deleted"] += 1
-            elif new_clarity != current_clarity:  # Only update if changed
+                self.log(
+                    f"[decay] marking for deletion: mem_id={mem_id[:8]}... | "
+                    f"clarity={new_clarity:.3f} < threshold={self.valves.clarity_threshold}",
+                    level="debug"
+                )
+            elif abs(new_clarity - base_clarity) > 0.0001:  # Only update if changed significantly
+                # Update clarity but keep base_clarity and last_reinforcement unchanged
                 meta["clarity"] = new_clarity
+                # Do NOT update base_clarity or last_reinforcement (no reinforcement occurred)
                 to_update.append({
                     "id": mem_id,
                     "text": content,
@@ -1340,7 +1372,7 @@ class Filter:
             try:
                 VECTOR_DB_CLIENT.delete(collection_name=collection_name, ids=to_delete)
                 self.log(
-                    f"deleted {len(to_delete)} memories due to low clarity",
+                    f"deleted {len(to_delete)} memories due to low clarity (threshold={self.valves.clarity_threshold})",
                     level="info"
                 )
             except Exception as e:
@@ -1351,6 +1383,8 @@ class Filter:
             try:
                 # Re-generate vectors for updated memories
                 from open_webui.main import app as webui_app
+
+                self.log(f"re-generating vectors for {len(to_update)} decayed memories", level="debug")
 
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
@@ -1372,6 +1406,11 @@ class Filter:
             except Exception as e:
                 self.log(f"failed to update memories: {e}", level="error")
 
+        self.log(
+            f"decay processing complete: total={stats['total']}, decayed={stats['decayed']}, deleted={stats['deleted']}, updated={stats['updated']}",
+            level="debug"
+        )
+
         return stats
 
     async def boost_retrieved_memories(
@@ -1382,12 +1421,15 @@ class Filter:
         """
         Boost clarity for memories that were just retrieved.
 
+        This is a reinforcement event - updates base_clarity and last_reinforcement
+        to reset the decay timeline.
+
         Args:
             retrieved_memories: List of Memory objects that were retrieved
             user: User model
 
         Side effects:
-            Updates clarity in vector database for retrieved memories
+            Updates clarity, base_clarity, last_reinforcement, and updated_at in vector database
         """
         if not retrieved_memories:
             return
@@ -1399,39 +1441,63 @@ class Filter:
 
         collection_name = f"user-memory-{user.id}"
         to_update = []
+        now_timestamp = int(time.time())
+
+        self.log(
+            f"boosting {len(retrieved_memories)} retrieved memories (boost_factor={self.valves.boost_factor})",
+            level="debug"
+        )
 
         for mem in retrieved_memories:
+            old_clarity = mem.clarity
             new_clarity = self.boost_memory_clarity(
-                current_clarity=mem.clarity,
+                current_clarity=old_clarity,
                 boost_factor=self.valves.boost_factor,
             )
 
             # Only update if clarity actually increased
-            if new_clarity > mem.clarity:
+            if new_clarity > old_clarity:
                 to_update.append({
                     "id": mem.mem_id,
                     "text": mem.content,
                     "metadata": {
                         "created_at": int(mem.created_at.timestamp()),
-                        "updated_at": int(time.time()),  # Update timestamp
+                        "updated_at": now_timestamp,
                         "clarity": new_clarity,
+                        # Key: Reset reinforcement baseline
+                        "base_clarity": new_clarity,
+                        "last_reinforcement": now_timestamp,
                     },
                 })
-                self.log(
-                    f"boosting memory {mem.mem_id[:8]}... clarity: {mem.clarity:.2f} → {new_clarity:.2f}",
-                    level="debug"
-                )
+
+                # Debug logging
+                if self.valves.debug_mode:
+                    self.log(
+                        f"[boost] mem_id={mem.mem_id[:8]}... | "
+                        f"old_clarity={old_clarity:.3f} | "
+                        f"new_clarity={new_clarity:.3f} | "
+                        f"boost={new_clarity - old_clarity:.3f} | "
+                        f"reinforcement_reset=true",
+                        level="debug"
+                    )
+                else:
+                    self.log(
+                        f"boosting memory {mem.mem_id[:8]}... clarity: {old_clarity:.2f} → {new_clarity:.2f}",
+                        level="debug"
+                    )
 
         if to_update:
             try:
                 # Re-generate vectors
+                self.log(f"re-generating vectors for {len(to_update)} boosted memories", level="debug")
+
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
                         item["text"], user=user
                     )
                     item["vector"] = vector
 
-                # Upsert with boosted clarity
+                # Upsert with boosted clarity and reset reinforcement baseline
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
                     items=[VectorItem(**item) for item in to_update],
@@ -1449,10 +1515,15 @@ class Filter:
         user: UserModel,
     ) -> None:
         """
-        Initialize clarity field for newly added memories.
+        Initialize clarity metadata for newly added memories.
 
-        Since Open WebUI's add_memory doesn't set clarity by default,
+        Since Open WebUI's add_memory doesn't set clarity metadata by default,
         we need to update it manually after insertion.
+
+        Sets:
+            - clarity: initial_clarity
+            - base_clarity: initial_clarity (reinforcement baseline)
+            - last_reinforcement: current timestamp
 
         Args:
             memory_ids: List of newly added memory IDs
@@ -1464,8 +1535,15 @@ class Filter:
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
         from open_webui.retrieval.vector.main import VectorItem
         from open_webui.main import app as webui_app
+        import time
 
         collection_name = f"user-memory-{user.id}"
+        now_timestamp = int(time.time())
+
+        self.log(
+            f"initializing clarity for {len(memory_ids)} new memories (initial_clarity={self.valves.initial_clarity})",
+            level="debug"
+        )
 
         try:
             # Get the newly added memories
@@ -1481,16 +1559,30 @@ class Filter:
 
             for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
                 if mem_id in memory_ids:
-                    # Add clarity to metadata
+                    # Initialize all clarity-related metadata
                     meta["clarity"] = self.valves.initial_clarity
+                    meta["base_clarity"] = self.valves.initial_clarity
+                    meta["last_reinforcement"] = now_timestamp
+
                     to_update.append({
                         "id": mem_id,
                         "text": content,
                         "metadata": meta,
                     })
 
+                    if self.valves.debug_mode:
+                        self.log(
+                            f"[init] mem_id={mem_id[:8]}... | "
+                            f"clarity={self.valves.initial_clarity} | "
+                            f"base_clarity={self.valves.initial_clarity} | "
+                            f"last_reinforcement={now_timestamp}",
+                            level="debug"
+                        )
+
             if to_update:
                 # Re-generate vectors and upsert
+                self.log(f"re-generating vectors for {len(to_update)} new memories", level="debug")
+
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
                         item["text"], user=user
@@ -1503,7 +1595,7 @@ class Filter:
                 )
                 self.log(
                     f"initialized clarity={self.valves.initial_clarity} for {len(to_update)} new memories",
-                    level="debug"
+                    level="info"
                 )
 
         except Exception as e:
