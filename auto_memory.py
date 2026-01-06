@@ -1393,10 +1393,9 @@ class Filter:
                     item["vector"] = vector
 
                 # Upsert with updated metadata
-                from open_webui.retrieval.vector.main import VectorItem
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
-                    items=[VectorItem(**item) for item in to_update],
+                    items=to_update,
                 )
                 stats["updated"] = len(to_update)
                 self.log(
@@ -1500,7 +1499,7 @@ class Filter:
                 # Upsert with boosted clarity and reset reinforcement baseline
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
-                    items=[VectorItem(**item) for item in to_update],
+                    items=to_update,
                 )
                 self.log(
                     f"boosted clarity for {len(to_update)} retrieved memories",
@@ -1591,7 +1590,7 @@ class Filter:
 
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
-                    items=[VectorItem(**item) for item in to_update],
+                    items=to_update,
                 )
                 self.log(
                     f"initialized clarity={self.valves.initial_clarity} for {len(to_update)} new memories",
