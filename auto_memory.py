@@ -154,7 +154,7 @@ Facts should remain separate when they represent distinct, independently-retriev
 
 - **Similar but distinct facts** - Related information representing different aspects or time periods
     - Example: "User works at Google" vs "User got promoted to team lead" (employment vs career progression)
-  
+
 - **Past events as journal entries** - Historical facts that provide temporal context
     - Example: "User bought a Samsung TV" and "User's Samsung TV broke" (separate events in time)
 
@@ -885,7 +885,12 @@ class Filter:
             if text_response is None:
                 raise ValueError(f"no text response from LLM. message={text_response}")
 
+            self.log(
+                f"raw text_response before stripping: {text_response[:200]}...",
+                level="debug",
+            )
             cleaned = _strip_json_fences(text_response)
+            self.log(f"cleaned after stripping: {cleaned[:200]}...", level="debug")
             return response_model.model_validate_json(cleaned)
 
     def __init__(self):
@@ -1194,13 +1199,9 @@ class Filter:
             - Ensures clarity never exceeds 1.0
         """
         if not 0.0 <= current_clarity <= 1.0:
-            raise ValueError(
-                f"clarity must be in [0.0, 1.0], got {current_clarity}"
-            )
+            raise ValueError(f"clarity must be in [0.0, 1.0], got {current_clarity}")
         if not 0.0 <= boost_factor <= 1.0:
-            raise ValueError(
-                f"boost_factor must be in [0.0, 1.0], got {boost_factor}"
-            )
+            raise ValueError(f"boost_factor must be in [0.0, 1.0], got {boost_factor}")
 
         clarity_boost = boost_factor * (1.0 - current_clarity)
         new_clarity = min(1.0, current_clarity + clarity_boost)
@@ -1240,9 +1241,7 @@ class Filter:
         import math
 
         if not 0.0 <= current_clarity <= 1.0:
-            raise ValueError(
-                f"clarity must be in [0.0, 1.0], got {current_clarity}"
-            )
+            raise ValueError(f"clarity must be in [0.0, 1.0], got {current_clarity}")
         if last_update_timestamp > now_timestamp:
             raise ValueError("last_update cannot be in the future")
         if decay_rate < 0:
@@ -1313,16 +1312,39 @@ class Filter:
 
         stats = {"total": len(ids_batch), "decayed": 0, "deleted": 0, "updated": 0}
 
+        # # Debug: Print all memories' clarity values before decay processing
+        # self.log("=== All Memories Clarity Report ===", level="info")
+        # for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
+        #     clarity = float(meta.get("clarity", self.valves.initial_clarity))
+        #     base_clarity = float(meta.get("base_clarity", meta.get("clarity", self.valves.initial_clarity)))
+        #     last_reinforcement = int(meta.get("last_reinforcement", meta.get("created_at", now_timestamp)))
+        #     content_preview = content[:50] + "..." if len(content) > 50 else content
+        #     self.log(
+        #         f"[memory] id={mem_id[:8]}... | "
+        #         f"clarity={clarity:.3f} | "
+        #         f"base_clarity={base_clarity:.3f} | "
+        #         f"last_reinforcement={last_reinforcement} | "
+        #         f"content={content_preview!r}",
+        #         level="info"
+        #     )
+        # self.log("=== End Clarity Report ===", level="info")
+
         self.log(
             f"processing decay for {len(ids_batch)} memories (decay_rate={self.valves.decay_rate}, threshold={self.valves.clarity_threshold})",
-            level="debug"
+            level="debug",
         )
 
         # 3. Process each memory
         for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
             # Read reinforcement baseline (for legacy memories, initialize from current state)
-            base_clarity = float(meta.get("base_clarity", meta.get("clarity", self.valves.initial_clarity)))
-            last_reinforcement = int(meta.get("last_reinforcement", meta.get("created_at", now_timestamp)))
+            base_clarity = float(
+                meta.get(
+                    "base_clarity", meta.get("clarity", self.valves.initial_clarity)
+                )
+            )
+            last_reinforcement = int(
+                meta.get("last_reinforcement", meta.get("created_at", now_timestamp))
+            )
 
             # Calculate time since last reinforcement
             time_delta_seconds = now_timestamp - last_reinforcement
@@ -1344,7 +1366,7 @@ class Filter:
                     f"days_since_reinforcement={time_delta_days:.1f} | "
                     f"new_clarity={new_clarity:.3f} | "
                     f"delta={new_clarity - base_clarity:.3f}",
-                    level="debug"
+                    level="debug",
                 )
 
             # Decide: delete or update
@@ -1354,26 +1376,33 @@ class Filter:
                 self.log(
                     f"[decay] marking for deletion: mem_id={mem_id[:8]}... | "
                     f"clarity={new_clarity:.3f} < threshold={self.valves.clarity_threshold}",
-                    level="debug"
+                    level="debug",
                 )
-            elif abs(new_clarity - base_clarity) > 0.0001:  # Only update if changed significantly
+            elif (
+                abs(new_clarity - base_clarity) > 0.0001
+            ):  # Only update if changed significantly
                 # Update clarity but keep base_clarity and last_reinforcement unchanged
                 meta["clarity"] = new_clarity
                 # Do NOT update base_clarity or last_reinforcement (no reinforcement occurred)
-                to_update.append({
-                    "id": mem_id,
-                    "text": content,
-                    "metadata": meta,
-                })
+                to_update.append(
+                    {
+                        "id": mem_id,
+                        "text": content,
+                        "metadata": meta,
+                    }
+                )
                 stats["decayed"] += 1
 
         # 4. Execute deletions
         if to_delete:
             try:
-                VECTOR_DB_CLIENT.delete(collection_name=collection_name, ids=to_delete)
+                deleted_count = 0
+                for mem_id in to_delete:
+                    await delete_memory_by_id(memory_id=mem_id, user=user)
+                    deleted_count += 1
                 self.log(
-                    f"deleted {len(to_delete)} memories due to low clarity (threshold={self.valves.clarity_threshold})",
-                    level="info"
+                    f"deleted {deleted_count} memories due to low clarity (threshold={self.valves.clarity_threshold})",
+                    level="info",
                 )
             except Exception as e:
                 self.log(f"failed to delete memories: {e}", level="error")
@@ -1384,7 +1413,10 @@ class Filter:
                 # Re-generate vectors for updated memories
                 from open_webui.main import app as webui_app
 
-                self.log(f"re-generating vectors for {len(to_update)} decayed memories", level="debug")
+                self.log(
+                    f"re-generating vectors for {len(to_update)} decayed memories",
+                    level="debug",
+                )
 
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
@@ -1398,16 +1430,13 @@ class Filter:
                     items=to_update,
                 )
                 stats["updated"] = len(to_update)
-                self.log(
-                    f"updated clarity for {len(to_update)} memories",
-                    level="info"
-                )
+                self.log(f"updated clarity for {len(to_update)} memories", level="info")
             except Exception as e:
                 self.log(f"failed to update memories: {e}", level="error")
 
         self.log(
             f"decay processing complete: total={stats['total']}, decayed={stats['decayed']}, deleted={stats['deleted']}, updated={stats['updated']}",
-            level="debug"
+            level="debug",
         )
 
         return stats
@@ -1434,7 +1463,6 @@ class Filter:
             return
 
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-        from open_webui.retrieval.vector.main import VectorItem
         from open_webui.main import app as webui_app
         import time
 
@@ -1444,7 +1472,7 @@ class Filter:
 
         self.log(
             f"boosting {len(retrieved_memories)} retrieved memories (boost_factor={self.valves.boost_factor})",
-            level="debug"
+            level="debug",
         )
 
         for mem in retrieved_memories:
@@ -1456,18 +1484,22 @@ class Filter:
 
             # Only update if clarity actually increased
             if new_clarity > old_clarity:
-                to_update.append({
-                    "id": mem.mem_id,
-                    "text": mem.content,
-                    "metadata": {
-                        "created_at": int(mem.created_at.timestamp()),
-                        "updated_at": now_timestamp,
-                        "clarity": new_clarity,
-                        # Key: Reset reinforcement baseline
-                        "base_clarity": new_clarity,
-                        "last_reinforcement": now_timestamp,
-                    },
-                })
+                to_update.append(
+                    {
+                        "id": mem.mem_id,
+                        "text": mem.content,
+                        "metadata": {
+                            "created_at": int(mem.created_at.timestamp()),
+                            "updated_at": int(
+                                mem.update_at.timestamp()
+                            ),  # Keep original updated_at (content not changed)
+                            "clarity": new_clarity,
+                            # Key: Reset reinforcement baseline
+                            "base_clarity": new_clarity,
+                            "last_reinforcement": now_timestamp,
+                        },
+                    }
+                )
 
                 # Debug logging
                 if self.valves.debug_mode:
@@ -1477,18 +1509,21 @@ class Filter:
                         f"new_clarity={new_clarity:.3f} | "
                         f"boost={new_clarity - old_clarity:.3f} | "
                         f"reinforcement_reset=true",
-                        level="debug"
+                        level="debug",
                     )
                 else:
                     self.log(
                         f"boosting memory {mem.mem_id[:8]}... clarity: {old_clarity:.2f} → {new_clarity:.2f}",
-                        level="debug"
+                        level="debug",
                     )
 
         if to_update:
             try:
                 # Re-generate vectors
-                self.log(f"re-generating vectors for {len(to_update)} boosted memories", level="debug")
+                self.log(
+                    f"re-generating vectors for {len(to_update)} boosted memories",
+                    level="debug",
+                )
 
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
@@ -1503,7 +1538,7 @@ class Filter:
                 )
                 self.log(
                     f"boosted clarity for {len(to_update)} retrieved memories",
-                    level="info"
+                    level="info",
                 )
             except Exception as e:
                 self.log(f"failed to boost memories: {e}", level="error")
@@ -1532,7 +1567,6 @@ class Filter:
             return
 
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-        from open_webui.retrieval.vector.main import VectorItem
         from open_webui.main import app as webui_app
         import time
 
@@ -1541,7 +1575,7 @@ class Filter:
 
         self.log(
             f"initializing clarity for {len(memory_ids)} new memories (initial_clarity={self.valves.initial_clarity})",
-            level="debug"
+            level="debug",
         )
 
         try:
@@ -1556,18 +1590,22 @@ class Filter:
 
             to_update = []
 
-            for mem_id, content, meta in zip(ids_batch, documents_batch, metadatas_batch):
+            for mem_id, content, meta in zip(
+                ids_batch, documents_batch, metadatas_batch
+            ):
                 if mem_id in memory_ids:
                     # Initialize all clarity-related metadata
                     meta["clarity"] = self.valves.initial_clarity
                     meta["base_clarity"] = self.valves.initial_clarity
                     meta["last_reinforcement"] = now_timestamp
 
-                    to_update.append({
-                        "id": mem_id,
-                        "text": content,
-                        "metadata": meta,
-                    })
+                    to_update.append(
+                        {
+                            "id": mem_id,
+                            "text": content,
+                            "metadata": meta,
+                        }
+                    )
 
                     if self.valves.debug_mode:
                         self.log(
@@ -1575,12 +1613,15 @@ class Filter:
                             f"clarity={self.valves.initial_clarity} | "
                             f"base_clarity={self.valves.initial_clarity} | "
                             f"last_reinforcement={now_timestamp}",
-                            level="debug"
+                            level="debug",
                         )
 
             if to_update:
                 # Re-generate vectors and upsert
-                self.log(f"re-generating vectors for {len(to_update)} new memories", level="debug")
+                self.log(
+                    f"re-generating vectors for {len(to_update)} new memories",
+                    level="debug",
+                )
 
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
@@ -1594,11 +1635,13 @@ class Filter:
                 )
                 self.log(
                     f"initialized clarity={self.valves.initial_clarity} for {len(to_update)} new memories",
-                    level="info"
+                    level="info",
                 )
 
         except Exception as e:
-            self.log(f"failed to initialize clarity for new memories: {e}", level="error")
+            self.log(
+                f"failed to initialize clarity for new memories: {e}", level="error"
+            )
 
     async def auto_memory(
         self,
@@ -1630,7 +1673,7 @@ class Filter:
                     await emit_status(
                         f"memory decay: {', '.join(decay_msg)}",
                         emitter=emitter,
-                        status="complete"
+                        status="complete",
                     )
 
         # === Get Related Memories ===
@@ -1802,7 +1845,6 @@ class Filter:
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
     ) -> dict:
-
         self.log("outlet invoked")
         if __user__ is None:
             raise ValueError("user information is required")
