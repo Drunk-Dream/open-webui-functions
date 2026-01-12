@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.0
+version: 1.3.1
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -1122,17 +1122,21 @@ class Filter:
         messages: list[dict[str, Any]],
         user: UserModel,
     ) -> list[Memory]:
+        from open_webui.internal.db import get_db
+
         memory_query = self.build_memory_query(messages)
 
         # Query related memories
         try:
-            results = await query_memory(
-                request=Request(scope={"type": "http", "app": webui_app}),
-                form_data=QueryMemoryForm(
-                    content=memory_query, k=self.valves.related_memories_n
-                ),
-                user=user,
-            )
+            with get_db() as db:
+                results = await query_memory(
+                    request=Request(scope={"type": "http", "app": webui_app}),
+                    form_data=QueryMemoryForm(
+                        content=memory_query, k=self.valves.related_memories_n
+                    ),
+                    user=user,
+                    db=db,
+                )
         except HTTPException as e:
             if e.status_code == 404:
                 self.log("no related memories found", level="info")
@@ -1396,9 +1400,18 @@ class Filter:
         # 4. Execute deletions
         if to_delete:
             try:
+                from open_webui.main import app as webui_app
+                from open_webui.internal.db import get_db
+
                 deleted_count = 0
                 for mem_id in to_delete:
-                    await delete_memory_by_id(memory_id=mem_id, user=user)
+                    with get_db() as db:
+                        await delete_memory_by_id(
+                            memory_id=mem_id,
+                            request=Request(scope={"type": "http", "app": webui_app}),
+                            user=user,
+                            db=db,
+                        )
                     deleted_count += 1
                 self.log(
                     f"deleted {deleted_count} memories due to low clarity (threshold={self.valves.clarity_threshold})",
@@ -1723,6 +1736,8 @@ class Filter:
         Execute memory actions from the plan.
         Order: delete -> update -> add (prevents conflicts)
         """
+        from open_webui.internal.db import get_db
+
         self.log("started apply_memory_actions", level="debug")
         actions = action_plan.actions
 
@@ -1737,84 +1752,95 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
-        # Group actions and define handlers
-        operations = {
-            "delete": {
-                "actions": [a for a in actions if a.action == "delete"],
-                "handler": lambda a: delete_memory_by_id(memory_id=a.id, user=user),
-                "log_msg": lambda a: f"deleted memory. id={a.id}",
-                "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
-                "skip_empty": lambda a: False,
-                "status_verb": "deleted",
-            },
-            "update": {
-                "actions": [a for a in actions if a.action == "update"],
-                "handler": lambda a: update_memory_by_id(
-                    memory_id=a.id,
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=MemoryUpdateModel(content=a.new_content),
+        # Create db session for all operations
+        with get_db() as db:
+            # Group actions and define handlers
+            operations = {
+                "delete": {
+                    "actions": [a for a in actions if a.action == "delete"],
+                    "handler": lambda a: delete_memory_by_id(
+                        memory_id=a.id,
+                        request=Request(scope={"type": "http", "app": webui_app}),
+                        user=user,
+                        db=db,
+                    ),
+                    "log_msg": lambda a: f"deleted memory. id={a.id}",
+                    "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
+                    "skip_empty": lambda a: False,
+                    "status_verb": "deleted",
+                },
+                "update": {
+                    "actions": [a for a in actions if a.action == "update"],
+                    "handler": lambda a: update_memory_by_id(
+                        memory_id=a.id,
+                        request=Request(scope={"type": "http", "app": webui_app}),
+                        form_data=MemoryUpdateModel(content=a.new_content),
+                        user=user,
+                        db=db,
+                    ),
+                    "log_msg": lambda a: f"updated memory. id={a.id}",
+                    "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
+                    "skip_empty": lambda a: not a.new_content.strip(),
+                    "status_verb": "updated",
+                },
+                "add": {
+                    "actions": [a for a in actions if a.action == "add"],
+                    "handler": lambda a: add_memory(
+                        request=Request(scope={"type": "http", "app": webui_app}),
+                        form_data=AddMemoryForm(content=a.content),
+                        user=user,
+                        db=db,
+                    ),
+                    "log_msg": lambda a: f"added memory. content={a.content}",
+                    "error_msg": lambda a, e: f"failed to add memory: {e}",
+                    "skip_empty": lambda a: not a.content.strip(),
+                    "status_verb": "saved",
+                },
+            }
+
+            # Process all operations in order
+            counts = {}
+            added_memory_ids = []  # Track newly added memory IDs for clarity initialization
+
+            for op_name, op_config in operations.items():
+                counts[op_name] = 0
+                for action in op_config["actions"]:
+                    if op_config["skip_empty"](action):
+                        continue
+                    try:
+                        result = await op_config["handler"](action)
+                        self.log(op_config["log_msg"](action))
+                        counts[op_name] += 1
+
+                        # Track newly added memory IDs
+                        if op_name == "add" and result:
+                            added_memory_ids.append(result.id)
+
+                    except Exception as e:
+                        raise RuntimeError(op_config["error_msg"](action, e))
+
+            # Initialize clarity for newly added memories
+            if self.valves.enable_memory_decay and added_memory_ids:
+                await self._initialize_memory_clarity(
+                    memory_ids=added_memory_ids,
                     user=user,
-                ),
-                "log_msg": lambda a: f"updated memory. id={a.id}",
-                "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
-                "skip_empty": lambda a: not a.new_content.strip(),
-                "status_verb": "updated",
-            },
-            "add": {
-                "actions": [a for a in actions if a.action == "add"],
-                "handler": lambda a: add_memory(
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=AddMemoryForm(content=a.content),
-                    user=user,
-                ),
-                "log_msg": lambda a: f"added memory. content={a.content}",
-                "error_msg": lambda a, e: f"failed to add memory: {e}",
-                "skip_empty": lambda a: not a.content.strip(),
-                "status_verb": "saved",
-            },
-        }
+                )
 
-        # Process all operations in order
-        counts = {}
-        added_memory_ids = []  # Track newly added memory IDs for clarity initialization
+            # Build status message
+            status_parts = []
+            for op_name, op_config in operations.items():
+                count = counts[op_name]
+                if count > 0:
+                    memory_word = "memory" if count == 1 else "memories"
+                    status_parts.append(
+                        f"{op_config['status_verb']} {count} {memory_word}"
+                    )
 
-        for op_name, op_config in operations.items():
-            counts[op_name] = 0
-            for action in op_config["actions"]:
-                if op_config["skip_empty"](action):
-                    continue
-                try:
-                    result = await op_config["handler"](action)
-                    self.log(op_config["log_msg"](action))
-                    counts[op_name] += 1
+            status_message = ", ".join(status_parts)
+            self.log(status_message or "no changes", level="info")
 
-                    # Track newly added memory IDs
-                    if op_name == "add" and result:
-                        added_memory_ids.append(result.id)
-
-                except Exception as e:
-                    raise RuntimeError(op_config["error_msg"](action, e))
-
-        # Initialize clarity for newly added memories
-        if self.valves.enable_memory_decay and added_memory_ids:
-            await self._initialize_memory_clarity(
-                memory_ids=added_memory_ids,
-                user=user,
-            )
-
-        # Build status message
-        status_parts = []
-        for op_name, op_config in operations.items():
-            count = counts[op_name]
-            if count > 0:
-                memory_word = "memory" if count == 1 else "memories"
-                status_parts.append(f"{op_config['status_verb']} {count} {memory_word}")
-
-        status_message = ", ".join(status_parts)
-        self.log(status_message or "no changes", level="info")
-
-        if status_message and self.user_valves.show_status:
-            await emit_status(status_message, emitter=emitter, status="complete")
+            if status_message and self.user_valves.show_status:
+                await emit_status(status_message, emitter=emitter, status="complete")
 
     def inlet(
         self,
