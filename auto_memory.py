@@ -576,11 +576,36 @@ def _run_detached(coro):
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(coro)
+        except Exception as e:
+            logging.getLogger(__name__).exception("Detached task failed: %s", e)
         finally:
             loop.close()
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
+
+
+class MemoryRepository:
+    """Centralized vector database operations for memory management."""
+
+    def __init__(self, user_id: str):
+        self.collection_name = f"user-memory-{user_id}"
+
+    def get_all_memories(self):
+        """Fetch all memories from vector database."""
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+
+        return VECTOR_DB_CLIENT.get(collection_name=self.collection_name)
+
+    async def upsert_with_vectors(self, items: list[dict], user, embedding_function):
+        """Upsert items with vector generation."""
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+
+        for item in items:
+            vector = await embedding_function(item["text"], user=user)
+            item["vector"] = vector
+
+        VECTOR_DB_CLIENT.upsert(collection_name=self.collection_name, items=items)
 
 
 R = TypeVar("R", bound=BaseModel)
@@ -796,20 +821,25 @@ class Filter:
         def _strip_json_fences(text: str) -> str:
             stripped = text.strip()
 
-            fenced = re.search(
-                r"```(?:json)?\s*([\s\S]*?)\s*```",
-                stripped,
-                flags=re.IGNORECASE,
-            )
-            if fenced:
-                return fenced.group(1).strip()
+            # Try multiple fence patterns
+            patterns = [
+                r"```json\s*([\s\S]*?)\s*```",  # ```json ... ```
+                r"```\s*([\s\S]*?)\s*```",  # ``` ... ```
+            ]
 
+            for pattern in patterns:
+                match = re.search(pattern, stripped, flags=re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+
+            # Fallback: manually strip fences
             if stripped.startswith("```"):
-                stripped = re.sub(
-                    r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE
-                )
+                # Remove opening fence and optional language identifier
+                stripped = re.sub(r"^```\w*\s*", "", stripped, flags=re.IGNORECASE)
             if stripped.endswith("```"):
-                stripped = re.sub(r"\s*```$", "", stripped)
+                # Remove closing fence
+                stripped = re.sub(r"\s*```\s*$", "", stripped)
+
             return stripped.strip()
 
         def _schema_instructions_for(model: Type[BaseModel]) -> str:
@@ -895,6 +925,28 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+
+    def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
+        """Synchronous helper for deleting memory in thread pool."""
+        from open_webui.internal.db import get_db
+        from open_webui.main import app as webui_app
+
+        with get_db() as db:
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    delete_memory_by_id(
+                        memory_id=mem_id,
+                        request=Request(scope={"type": "http", "app": webui_app}),
+                        user=user,
+                        db=db,
+                    )
+                )
+            finally:
+                loop.close()
 
     def extract_memory_context(self, content: str) -> Optional[tuple[str, list[dict]]]:
         """
@@ -1401,17 +1453,14 @@ class Filter:
         if to_delete:
             try:
                 from open_webui.main import app as webui_app
-                from open_webui.internal.db import get_db
 
                 deleted_count = 0
                 for mem_id in to_delete:
-                    with get_db() as db:
-                        await delete_memory_by_id(
-                            memory_id=mem_id,
-                            request=Request(scope={"type": "http", "app": webui_app}),
-                            user=user,
-                            db=db,
-                        )
+                    await asyncio.to_thread(
+                        self._delete_memory_sync,
+                        mem_id=mem_id,
+                        user=user,
+                    )
                     deleted_count += 1
                 self.log(
                     f"deleted {deleted_count} memories due to low clarity (threshold={self.valves.clarity_threshold})",
@@ -1420,24 +1469,23 @@ class Filter:
             except Exception as e:
                 self.log(f"failed to delete memories: {e}", level="error")
 
-        # 5. Batch update (requires re-generating vectors)
+        # 5. Batch update (regenerate vectors since get() doesn't return embeddings)
         if to_update:
             try:
-                # Re-generate vectors for updated memories
                 from open_webui.main import app as webui_app
 
                 self.log(
-                    f"re-generating vectors for {len(to_update)} decayed memories",
+                    f"updating metadata for {len(to_update)} decayed memories",
                     level="debug",
                 )
 
+                # Generate vectors for all items
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
                         item["text"], user=user
                     )
                     item["vector"] = vector
 
-                # Upsert with updated metadata
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
                     items=to_update,
@@ -1532,19 +1580,20 @@ class Filter:
 
         if to_update:
             try:
-                # Re-generate vectors
+                from open_webui.main import app as webui_app
+
                 self.log(
-                    f"re-generating vectors for {len(to_update)} boosted memories",
+                    f"updating metadata for {len(to_update)} boosted memories",
                     level="debug",
                 )
 
+                # Generate vectors for all items
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
                         item["text"], user=user
                     )
                     item["vector"] = vector
 
-                # Upsert with boosted clarity and reset reinforcement baseline
                 VECTOR_DB_CLIENT.upsert(
                     collection_name=collection_name,
                     items=to_update,
@@ -1630,12 +1679,12 @@ class Filter:
                         )
 
             if to_update:
-                # Re-generate vectors and upsert
                 self.log(
-                    f"re-generating vectors for {len(to_update)} new memories",
+                    f"updating metadata for {len(to_update)} new memories",
                     level="debug",
                 )
 
+                # Generate vectors for all items
                 for item in to_update:
                     vector = await webui_app.state.EMBEDDING_FUNCTION(
                         item["text"], user=user
