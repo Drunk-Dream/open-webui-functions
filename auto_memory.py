@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.1
+version: 1.3.2
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -819,28 +819,47 @@ class Filter:
         ]
 
         def _strip_json_fences(text: str) -> str:
+            """Strip markdown code fences from JSON response.
+
+            Handles various fence formats:
+            - ```json\n{...}\n```
+            - ```\n{...}\n```
+            - ``` json\n{...}\n```
+            """
             stripped = text.strip()
 
-            # Try multiple fence patterns
+            # Try regex patterns with greedy matching
             patterns = [
-                r"```json\s*([\s\S]*?)\s*```",  # ```json ... ```
-                r"```\s*([\s\S]*?)\s*```",  # ``` ... ```
+                r"^```json\s*\n?(.*?)```$",  # ```json ... ```
+                r"^```\s*json\s*\n?(.*?)```$",  # ``` json ... ```
+                r"^```\s*\n?(.*?)```$",  # ``` ... ```
             ]
 
             for pattern in patterns:
-                match = re.search(pattern, stripped, flags=re.IGNORECASE)
+                match = re.search(pattern, stripped, flags=re.IGNORECASE | re.DOTALL)
                 if match:
                     return match.group(1).strip()
 
-            # Fallback: manually strip fences
-            if stripped.startswith("```"):
-                # Remove opening fence and optional language identifier
-                stripped = re.sub(r"^```\w*\s*", "", stripped, flags=re.IGNORECASE)
-            if stripped.endswith("```"):
-                # Remove closing fence
-                stripped = re.sub(r"\s*```\s*$", "", stripped)
+            # Fallback: line-by-line stripping
+            lines = stripped.split("\n")
 
-            return stripped.strip()
+            # Remove opening fence (first line if it starts with ```)
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+
+            # Remove closing fence (last line if it starts with ```)
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+
+            result = "\n".join(lines).strip()
+
+            # Final check: if still starts/ends with ```, do character-level strip
+            if result.startswith("```"):
+                result = re.sub(r"^```\w*\s*\n?", "", result, flags=re.IGNORECASE)
+            if result.endswith("```"):
+                result = re.sub(r"\n?\s*```\s*$", "", result)
+
+            return result.strip()
 
         def _schema_instructions_for(model: Type[BaseModel]) -> str:
             schema_json = json.dumps(
@@ -1342,8 +1361,9 @@ class Filter:
                 "updated": number of memories updated
             }
         """
-        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
         import time
+
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
         collection_name = f"user-memory-{user.id}"
 
@@ -1523,9 +1543,10 @@ class Filter:
         if not retrieved_memories:
             return
 
-        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-        from open_webui.main import app as webui_app
         import time
+
+        from open_webui.main import app as webui_app
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
         collection_name = f"user-memory-{user.id}"
         to_update = []
@@ -1628,9 +1649,10 @@ class Filter:
         if not memory_ids:
             return
 
-        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-        from open_webui.main import app as webui_app
         import time
+
+        from open_webui.main import app as webui_app
+        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
         collection_name = f"user-memory-{user.id}"
         now_timestamp = int(time.time())
