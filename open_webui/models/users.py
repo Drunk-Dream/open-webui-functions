@@ -1,8 +1,13 @@
 """Minimal Open WebUI models.users module."""
 
-from typing import Any
+from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+
+class UserSettings(BaseModel):
+    ui: Optional[dict] = {}
+    model_config = ConfigDict(extra="allow")
 
 
 class UserModel(BaseModel):
@@ -12,7 +17,7 @@ class UserModel(BaseModel):
     name: str
     email: str
     role: str = "user"
-    settings: dict[str, Any] | None = None
+    settings: Optional[UserSettings] = None
 
 
 class Users:
