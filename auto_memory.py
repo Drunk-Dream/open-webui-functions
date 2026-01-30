@@ -1650,6 +1650,70 @@ class Filter:
 
         return stats
 
+    async def cleanup_expired_memories(
+        self,
+        user: UserModel,
+    ) -> dict[str, int]:
+        """
+        Delete expired memories from both vector database and expiry table.
+
+        Queries the MemoryExpiryTable for records where expired_at < now,
+        then deletes each expired memory from the vector database and
+        removes the corresponding expiry record.
+
+        Args:
+            user: User model for ownership verification
+
+        Returns:
+            Statistics dict: {"total": N, "deleted": M}
+        """
+        import time
+
+        now_timestamp = int(time.time())
+        expiry_table = MemoryExpiryTable()
+
+        # Get expired records
+        expired_records = expiry_table.get_expired(user.id, now_timestamp)
+
+        stats = {"total": len(expired_records), "deleted": 0}
+
+        if not expired_records:
+            self.log("no expired memories found", level="debug")
+            return stats
+
+        self.log(f"found {len(expired_records)} expired memories", level="info")
+
+        # Delete each expired memory
+        for record in expired_records:
+            try:
+                # Delete from vector database
+                await asyncio.to_thread(
+                    self._delete_memory_sync,
+                    mem_id=record.mem_id,
+                    user=user,
+                )
+
+                # Delete from expiry table
+                expiry_table.delete_by_mem_id(record.mem_id)
+
+                stats["deleted"] += 1
+                self.log(
+                    f"deleted expired memory: {record.mem_id[:8]}...", level="debug"
+                )
+
+            except Exception as e:
+                self.log(
+                    f"failed to delete expired memory {record.mem_id}: {e}",
+                    level="error",
+                )
+
+        self.log(
+            f"cleanup complete: deleted {stats['deleted']}/{stats['total']} expired memories",
+            level="info",
+        )
+
+        return stats
+
     async def boost_retrieved_memories(
         self,
         retrieved_memories: list[Memory],
@@ -1890,6 +1954,15 @@ class Filter:
 
         # === Get Related Memories ===
         related_memories = await self.get_related_memories(messages=messages, user=user)
+
+        # === Cleanup Expired Memories ===
+        cleanup_stats = await self.cleanup_expired_memories(user)
+        if cleanup_stats["deleted"] > 0 and self.user_valves.show_status:
+            await emit_status(
+                f"cleaned up {cleanup_stats['deleted']} expired memories",
+                emitter=emitter,
+                status="complete",
+            )
 
         # === Boost Retrieved Memories ===
         if self.valves.enable_memory_decay and related_memories:
