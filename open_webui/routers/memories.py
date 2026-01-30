@@ -1,6 +1,6 @@
 """Minimal Open WebUI routers.memories module."""
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Request
 from pydantic import BaseModel
@@ -19,23 +19,24 @@ class AddMemoryForm(BaseModel):
 class MemoryUpdateModel(BaseModel):
     """Model for updating memory."""
 
-    content: str
+    content: Optional[str] = None
 
 
 class QueryMemoryForm(BaseModel):
     """Form for querying memory."""
 
-    query: str
+    content: str
+    k: int = 1
 
 
 async def add_memory(
-    form: AddMemoryForm,
     request: Request,
+    form_data: AddMemoryForm,
     user: UserModel,
     db: Session,
 ) -> dict[str, Any]:
     """Add a memory."""
-    return {"id": "mock-mem-id", "content": form.content}
+    return {"id": "mock-mem-id", "content": form_data.content}
 
 
 async def delete_memory_by_id(
@@ -49,8 +50,8 @@ async def delete_memory_by_id(
 
 
 async def query_memory(
-    form: QueryMemoryForm,
     request: Request,
+    form_data: QueryMemoryForm,
     user: UserModel,
     db: Session,
 ) -> SearchResult:
@@ -60,10 +61,10 @@ async def query_memory(
 
 async def update_memory_by_id(
     memory_id: str,
-    form: MemoryUpdateModel,
     request: Request,
+    form_data: MemoryUpdateModel,
     user: UserModel,
     db: Session,
 ) -> dict[str, Any]:
     """Update a memory by ID."""
-    return {"id": memory_id, "content": form.content}
+    return {"id": memory_id, "content": form_data.content}

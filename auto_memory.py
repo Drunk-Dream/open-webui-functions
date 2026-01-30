@@ -608,6 +608,7 @@ class MemoryExpiry(Base):
 
     __table_args__ = (
         Index("ix_auto_memory_expiry_user_expired", "user_id", "expired_at"),
+        {"extend_existing": True},
     )
 
 
@@ -699,6 +700,21 @@ class MemoryExpiryTable:
 
 
 MemoryExpiries = MemoryExpiryTable()
+
+
+def _ensure_table_exists():
+    """Ensure MemoryExpiry table exists in database."""
+    try:
+        Base.metadata.create_all(
+            engine,
+            tables=[MemoryExpiry.__table__],  # type: ignore
+            checkfirst=True,
+        )
+    except Exception:
+        pass
+
+
+_ensure_table_exists()
 
 
 class MemoryRepository:
@@ -1042,8 +1058,6 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Create MemoryExpiry table if it doesn't exist
-        Base.metadata.create_all(engine, tables=[MemoryExpiry.__table__])  # type: ignore
 
     def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
         """Synchronous helper for deleting memory in thread pool."""
@@ -1311,8 +1325,10 @@ class Filter:
         try:
             with get_db() as db:
                 results = await query_memory(
-                    form=QueryMemoryForm(query=memory_query),
                     request=Request(scope={"type": "http", "app": webui_app}),
+                    form_data=QueryMemoryForm(
+                        content=memory_query, k=self.valves.related_memories_n
+                    ),
                     user=user,
                     db=db,
                 )
@@ -1607,8 +1623,8 @@ class Filter:
                     "actions": [a for a in actions if a.action == "update"],
                     "handler": lambda a: update_memory_by_id(
                         memory_id=a.id,
-                        form=MemoryUpdateModel(content=a.new_content),
                         request=Request(scope={"type": "http", "app": webui_app}),
+                        form_data=MemoryUpdateModel(content=a.new_content),
                         user=user,
                         db=db,
                     ),
@@ -1620,8 +1636,8 @@ class Filter:
                 "add": {
                     "actions": [a for a in actions if a.action == "add"],
                     "handler": lambda a: add_memory(
-                        form=AddMemoryForm(content=a.content),
                         request=Request(scope={"type": "http", "app": webui_app}),
+                        form_data=AddMemoryForm(content=a.content),
                         user=user,
                         db=db,
                     ),
@@ -1713,7 +1729,9 @@ class Filter:
             level="debug",
         )
 
-        if user.settings and not (user.settings.get("ui") or {}).get("memory", True):
+        # Check if memory is disabled in user settings
+        # user.settings is Optional[UserSettings], where UserSettings.ui is Optional[dict]
+        if user.settings and not (user.settings.ui or {}).get("memory", True):  # type: ignore
             self.log(
                 "memory is disabled in user's personalization settings, skipping",
                 level="info",
