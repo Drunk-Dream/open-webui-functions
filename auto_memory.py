@@ -1714,6 +1714,79 @@ class Filter:
 
         return stats
 
+    async def boost_memories(
+        self,
+        related_memories: list[Memory],
+        user: UserModel,
+    ) -> dict[str, int]:
+        """
+        Boost (extend expiry time) for retrieved memories.
+
+        For each memory in related_memories:
+        - If expiry record exists: update expired_at = now + extension_days
+        - If expiry record doesn't exist: create new record with expired_at = now + initial_expiry_days
+
+        Args:
+            related_memories: List of Memory objects that were retrieved
+            user: User model
+
+        Returns:
+            Statistics dict: {"total": N, "boosted": M, "created": K}
+        """
+        import time
+
+        if not related_memories:
+            return {"total": 0, "boosted": 0, "created": 0}
+
+        now_timestamp = int(time.time())
+        expiry_table = MemoryExpiryTable()
+
+        stats = {"total": len(related_memories), "boosted": 0, "created": 0}
+
+        self.log(f"boosting {len(related_memories)} retrieved memories", level="debug")
+
+        for memory in related_memories:
+            try:
+                # Check if expiry record exists
+                existing = expiry_table.get_by_mem_id(memory.mem_id)
+
+                if existing:
+                    # Update existing record
+                    new_expired_at = now_timestamp + (
+                        self.valves.extension_days * 86400
+                    )
+                    expiry_table.update_expired_at(memory.mem_id, new_expired_at)
+                    stats["boosted"] += 1
+                    self.log(
+                        f"boosted memory {memory.mem_id[:8]}... expiry extended by {self.valves.extension_days} days",
+                        level="debug",
+                    )
+                else:
+                    # Create new record
+                    new_expired_at = now_timestamp + (
+                        self.valves.initial_expiry_days * 86400
+                    )
+                    expiry_table.insert(
+                        mem_id=memory.mem_id,
+                        user_id=user.id,
+                        expired_at=new_expired_at,
+                    )
+                    stats["created"] += 1
+                    self.log(
+                        f"created expiry for memory {memory.mem_id[:8]}... expires in {self.valves.initial_expiry_days} days",
+                        level="debug",
+                    )
+
+            except Exception as e:
+                self.log(f"failed to boost memory {memory.mem_id}: {e}", level="error")
+
+        self.log(
+            f"boost complete: boosted {stats['boosted']}, created {stats['created']}",
+            level="info",
+        )
+
+        return stats
+
     async def boost_retrieved_memories(
         self,
         retrieved_memories: list[Memory],
@@ -1955,6 +2028,18 @@ class Filter:
         # === Get Related Memories ===
         related_memories = await self.get_related_memories(messages=messages, user=user)
 
+        # === Boost Retrieved Memories (extend expiry) ===
+        if related_memories:
+            boost_stats = await self.boost_memories(related_memories, user)
+            if (
+                boost_stats["boosted"] > 0 or boost_stats["created"] > 0
+            ) and self.user_valves.show_status:
+                await emit_status(
+                    f"boosted {boost_stats['boosted']} memories, created {boost_stats['created']} expiry records",
+                    emitter=emitter,
+                    status="complete",
+                )
+
         # === Cleanup Expired Memories ===
         cleanup_stats = await self.cleanup_expired_memories(user)
         if cleanup_stats["deleted"] > 0 and self.user_valves.show_status:
@@ -1963,11 +2048,6 @@ class Filter:
                 emitter=emitter,
                 status="complete",
             )
-
-        # === Boost Retrieved Memories ===
-        if self.valves.enable_memory_decay and related_memories:
-            self.log("boosting retrieved memories", level="debug")
-            await self.boost_retrieved_memories(related_memories, user)
 
         stringified_memories = json.dumps(
             [memory.model_dump(mode="json") for memory in related_memories]
