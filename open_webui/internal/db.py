@@ -31,6 +31,7 @@ def get_db_context(db: Session | None = None) -> Generator[Session, None, None]:
             session.close()
 
 
+@contextmanager
 def get_db() -> Generator[Session, None, None]:
     """Get database session."""
     SessionLocal = sessionmaker(bind=engine)

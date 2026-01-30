@@ -1,5 +1,7 @@
 """Minimal Open WebUI models.users module."""
 
+from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -10,6 +12,7 @@ class UserModel(BaseModel):
     name: str
     email: str
     role: str = "user"
+    settings: dict[str, Any] | None = None
 
 
 class Users:
