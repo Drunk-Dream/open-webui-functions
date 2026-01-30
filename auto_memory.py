@@ -31,9 +31,12 @@ from typing import (
 )
 
 from fastapi import HTTPException, Request
+from open_webui.internal.db import Base, engine, get_db_context
 from open_webui.main import app as webui_app
 from open_webui.models.users import UserModel, Users
 from open_webui.retrieval.vector.main import SearchResult
+from sqlalchemy import BigInteger, Column, Index, String
+from sqlalchemy.orm import Session
 from open_webui.routers.memories import (
     AddMemoryForm,
     MemoryUpdateModel,
@@ -585,6 +588,117 @@ def _run_detached(coro):
     thread.start()
 
 
+####################
+# MemoryExpiry DB Schema
+####################
+
+
+class MemoryExpiry(Base):
+    """SQLAlchemy model for tracking memory expiration times."""
+
+    __tablename__ = "auto_memory_expiry"
+
+    mem_id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False, index=True)
+    expired_at = Column(BigInteger, nullable=False, index=True)
+    created_at = Column(BigInteger, nullable=False)
+    updated_at = Column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_auto_memory_expiry_user_expired", "user_id", "expired_at"),
+    )
+
+
+class MemoryExpiryTable:
+    """CRUD operations for memory expiry tracking."""
+
+    def insert(
+        self,
+        mem_id: str,
+        user_id: str,
+        expired_at: int,
+        db: Optional[Session] = None,
+    ) -> Optional[MemoryExpiry]:
+        """Insert a new memory expiry record."""
+        import time
+
+        with get_db_context(db) as db:
+            now = int(time.time())
+            expiry = MemoryExpiry(
+                mem_id=mem_id,
+                user_id=user_id,
+                expired_at=expired_at,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(expiry)
+            db.commit()
+            db.refresh(expiry)
+            return expiry
+
+    def get_by_mem_id(
+        self,
+        mem_id: str,
+        db: Optional[Session] = None,
+    ) -> Optional[MemoryExpiry]:
+        """Get expiry record by memory ID."""
+        with get_db_context(db) as db:
+            return db.get(MemoryExpiry, mem_id)
+
+    def update_expired_at(
+        self,
+        mem_id: str,
+        expired_at: int,
+        db: Optional[Session] = None,
+    ) -> Optional[MemoryExpiry]:
+        """Update the expiration time for a memory."""
+        import time
+
+        with get_db_context(db) as db:
+            expiry = db.get(MemoryExpiry, mem_id)
+            if not expiry:
+                return None
+            expiry.expired_at = expired_at
+            expiry.updated_at = int(time.time())
+            db.commit()
+            db.refresh(expiry)
+            return expiry
+
+    def delete_by_mem_id(
+        self,
+        mem_id: str,
+        db: Optional[Session] = None,
+    ) -> bool:
+        """Delete expiry record by memory ID."""
+        with get_db_context(db) as db:
+            expiry = db.get(MemoryExpiry, mem_id)
+            if not expiry:
+                return False
+            db.delete(expiry)
+            db.commit()
+            return True
+
+    def get_expired(
+        self,
+        user_id: str,
+        now_timestamp: int,
+        db: Optional[Session] = None,
+    ) -> list[MemoryExpiry]:
+        """Get all expired memories for a user."""
+        with get_db_context(db) as db:
+            return (
+                db.query(MemoryExpiry)
+                .filter(
+                    MemoryExpiry.user_id == user_id,
+                    MemoryExpiry.expired_at < now_timestamp,
+                )
+                .all()
+            )
+
+
+MemoryExpiries = MemoryExpiryTable()
+
+
 class MemoryRepository:
     """Centralized vector database operations for memory management."""
 
@@ -680,6 +794,18 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="clarity boost when memory is retrieved (0.0-1.0). higher = stronger reinforcement when memory is accessed.",
+        )
+
+        # ===== Memory Expiry Configuration =====
+        initial_expiry_days: int = Field(
+            default=30,
+            ge=1,
+            description="initial expiry time for new memories (days). memories will expire after this many days if not accessed.",
+        )
+        extension_days: int = Field(
+            default=14,
+            ge=1,
+            description="extension time when memory is accessed (days). accessed memories will have their expiry extended by this many days.",
         )
 
     class UserValves(BaseModel):
@@ -944,6 +1070,8 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Create MemoryExpiry table if it doesn't exist
+        Base.metadata.create_all(engine, tables=[MemoryExpiry.__table__])
 
     def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
         """Synchronous helper for deleting memory in thread pool."""
