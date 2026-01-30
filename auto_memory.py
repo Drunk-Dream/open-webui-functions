@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.2
+version: 1.3.3
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -31,12 +31,15 @@ from typing import (
 )
 
 from fastapi import HTTPException, Request
+from openai import BadRequestError, OpenAI
+from pydantic import BaseModel, Field, create_model
+from sqlalchemy import BigInteger, Column, Index, String
+from sqlalchemy.orm import Session
+
 from open_webui.internal.db import Base, engine, get_db_context
 from open_webui.main import app as webui_app
 from open_webui.models.users import UserModel, Users
 from open_webui.retrieval.vector.main import SearchResult
-from sqlalchemy import BigInteger, Column, Index, String
-from sqlalchemy.orm import Session
 from open_webui.routers.memories import (
     AddMemoryForm,
     MemoryUpdateModel,
@@ -46,8 +49,6 @@ from open_webui.routers.memories import (
     query_memory,
     update_memory_by_id,
 )
-from openai import BadRequestError, OpenAI
-from pydantic import BaseModel, Field, create_model
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
@@ -483,38 +484,49 @@ def build_actions_request_model(existing_ids: list[str]):
     """
     if not existing_ids:
         # No IDs to constrain, so no relevant memories = can only create new memories
-        allowed_actions = MemoryAddAction
+        return create_model(
+            "MemoriesActionRequest",
+            actions=(
+                list[MemoryAddAction],
+                Field(
+                    default_factory=list,
+                    description="List of actions to perform on memories",
+                    max_length=20,
+                ),
+            ),
+            __base__=BaseModel,
+        )
     else:
-        id_literal_type = Literal[tuple(existing_ids)]
+        id_literal_type = Literal[tuple(existing_ids)]  # type: ignore[misc,valid-type]
 
         DynamicMemoryUpdateAction = create_model(
             "MemoryUpdateAction",
-            id=(id_literal_type, ...),
+            id=(id_literal_type, ...),  # type: ignore[valid-type]
             __base__=MemoryUpdateAction,
         )
 
         DynamicMemoryDeleteAction = create_model(
             "MemoryDeleteAction",
-            id=(id_literal_type, ...),
+            id=(id_literal_type, ...),  # type: ignore[valid-type]
             __base__=MemoryDeleteAction,
         )
 
-        allowed_actions = Union[
-            MemoryAddAction, DynamicMemoryUpdateAction, DynamicMemoryDeleteAction
+        AllowedActions = Union[  # type: ignore[valid-type]
+            MemoryAddAction, DynamicMemoryUpdateAction, DynamicMemoryDeleteAction  # type: ignore[valid-type]
         ]
 
-    return create_model(
-        "MemoriesActionRequest",
-        actions=(
-            list[allowed_actions],
-            Field(
-                default_factory=list,
-                description="List of actions to perform on memories",
-                max_length=20,
+        return create_model(
+            "MemoriesActionRequest",
+            actions=(
+                list[AllowedActions],  # type: ignore[valid-type]
+                Field(
+                    default_factory=list,
+                    description="List of actions to perform on memories",
+                    max_length=20,
+                ),
             ),
-        ),
-        __base__=BaseModel,
-    )
+            __base__=BaseModel,
+        )
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -648,8 +660,8 @@ class MemoryExpiryTable:
             expiry = db.get(MemoryExpiry, mem_id)
             if not expiry:
                 return None
-            expiry.expired_at = expired_at
-            expiry.updated_at = int(time.time())
+            expiry.expired_at = expired_at  # pyright: ignore
+            expiry.updated_at = int(time.time())  # type: ignore
             db.commit()
             db.refresh(expiry)
             return expiry
@@ -1031,7 +1043,7 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         # Create MemoryExpiry table if it doesn't exist
-        Base.metadata.create_all(engine, tables=[MemoryExpiry.__table__])
+        Base.metadata.create_all(engine, tables=[MemoryExpiry.__table__])  # type: ignore
 
     def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
         """Synchronous helper for deleting memory in thread pool."""
@@ -1278,6 +1290,75 @@ class Filter:
 
     async def get_related_memories(
         self,
+        messages: list[dict[str, Any]],
+        user: UserModel,
+    ) -> list[Memory]:
+        """
+        Query and retrieve related memories based on conversation context.
+
+        Args:
+            messages: Conversation messages to build query from
+            user: User model for ownership verification
+
+        Returns:
+            List of Memory objects filtered by minimum similarity threshold
+        """
+        from open_webui.internal.db import get_db
+
+        memory_query = self.build_memory_query(messages)
+
+        # Query related memories
+        try:
+            with get_db() as db:
+                results = await query_memory(
+                    form=QueryMemoryForm(query=memory_query),
+                    request=Request(scope={"type": "http", "app": webui_app}),
+                    user=user,
+                    db=db,
+                )
+        except HTTPException as e:
+            if e.status_code == 404:
+                self.log("no related memories found", level="info")
+                results = None
+            else:
+                self.log(
+                    f"failed to query memories due to HTTP error {e.status_code}: {e.detail}",
+                    level="error",
+                )
+                raise RuntimeError("failed to query memories") from e
+        except Exception as e:
+            self.log(f"failed to query memories: {e}", level="error")
+            raise RuntimeError("failed to query memories") from e
+
+        related_memories = searchresults_to_memories(results) if results else []
+        self.log(
+            f"found {len(related_memories)} related memories before filtering",
+            level="info",
+        )
+
+        # Filter by minimum similarity if configured
+        if self.valves.minimum_memory_similarity is not None:
+            filtered_memories = [
+                mem
+                for mem in related_memories
+                if mem.similarity_score is not None
+                and mem.similarity_score >= self.valves.minimum_memory_similarity
+            ]
+            filtered_count = len(related_memories) - len(filtered_memories)
+            if filtered_count > 0:
+                self.log(
+                    f"filtered out {filtered_count} memories below similarity threshold {self.valves.minimum_memory_similarity}",
+                    level="info",
+                )
+            related_memories = filtered_memories
+
+        self.log(f"using {len(related_memories)} related memories", level="info")
+        self.log(f"related memories: {related_memories}", level="debug")
+
+        return related_memories
+
+    async def cleanup_expired_memories(
+        self,
         user: UserModel,
     ) -> dict[str, int]:
         """
@@ -1315,12 +1396,12 @@ class Filter:
                 # Delete from vector database
                 await asyncio.to_thread(
                     self._delete_memory_sync,
-                    mem_id=record.mem_id,
+                    mem_id=record.mem_id,  # type: ignore
                     user=user,
                 )
 
                 # Delete from expiry table
-                expiry_table.delete_by_mem_id(record.mem_id)
+                expiry_table.delete_by_mem_id(record.mem_id)  # type: ignore
 
                 stats["deleted"] += 1
                 self.log(
@@ -1495,7 +1576,7 @@ class Filter:
         actions = action_plan.actions
 
         # Show processing status
-        if emitter and len(actions) > 0:
+        if emitter is not None and len(actions) > 0:
             self.log(f"processing {len(actions)} memory actions", level="debug")
             await emit_status(
                 f"processing {len(actions)} memory actions",
@@ -1508,7 +1589,7 @@ class Filter:
         # Create db session for all operations
         with get_db() as db:
             # Group actions and define handlers
-            operations = {
+            operations: dict[str, dict[str, Any]] = {
                 "delete": {
                     "actions": [a for a in actions if a.action == "delete"],
                     "handler": lambda a: delete_memory_by_id(
@@ -1526,8 +1607,8 @@ class Filter:
                     "actions": [a for a in actions if a.action == "update"],
                     "handler": lambda a: update_memory_by_id(
                         memory_id=a.id,
+                        form=MemoryUpdateModel(content=a.new_content),
                         request=Request(scope={"type": "http", "app": webui_app}),
-                        form_data=MemoryUpdateModel(content=a.new_content),
                         user=user,
                         db=db,
                     ),
@@ -1539,8 +1620,8 @@ class Filter:
                 "add": {
                     "actions": [a for a in actions if a.action == "add"],
                     "handler": lambda a: add_memory(
+                        form=AddMemoryForm(content=a.content),
                         request=Request(scope={"type": "http", "app": webui_app}),
-                        form_data=AddMemoryForm(content=a.content),
                         user=user,
                         db=db,
                     ),
@@ -1560,7 +1641,7 @@ class Filter:
                     if op_config["skip_empty"](action):
                         continue
                     try:
-                        result = await op_config["handler"](action)
+                        await op_config["handler"](action)
                         self.log(op_config["log_msg"](action))
                         counts[op_name] += 1
 
@@ -1632,7 +1713,7 @@ class Filter:
             level="debug",
         )
 
-        if user.settings and not (user.settings.ui or {}).get("memory", True):
+        if user.settings and not (user.settings.get("ui") or {}).get("memory", True):
             self.log(
                 "memory is disabled in user's personalization settings, skipping",
                 level="info",
