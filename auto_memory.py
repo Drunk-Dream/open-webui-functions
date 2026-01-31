@@ -1018,12 +1018,35 @@ class Filter:
             )
 
             message = response.choices[0].message
-            if message.parsed is None:
+
+            # 1. 优先使用 SDK 自动解析的结果
+            if message.parsed:
+                return cast(R, message.parsed)
+
+            # 2. 如果自动解析失败（parsed is None），检查是否有拒绝对话（Refusal）
+            if getattr(message, "refusal", None):
                 raise ValueError(
-                    f"unable to parse structured response. message={message}"
+                    f"Model refused to generate structured output: {message.refusal}"
                 )
 
-            return cast(R, message.parsed)
+            # 3. 如果 parsed 为 None 但存在 content，说明模型可能返回了非标准格式（如带 markdown 围栏）
+            #    此时尝试手动清洗和解析
+            if message.content:
+                self.log(
+                    f"message.parsed is None, falling back to manual cleaning. Raw content: {message.content[:200]}...",
+                    level="warning",
+                )
+                cleaned = _strip_json_fences(message.content)
+                self.log(
+                    f"Cleaned content in try-block: {cleaned[:200]}...", level="debug"
+                )
+
+                # 手动调用 Pydantic 的验证方法
+                # 注意：如果 JSON 依然非法，这里会抛出 ValidationError，建议根据需要决定是否捕获
+                return response_model.model_validate_json(cleaned)
+
+            # 4. 既没有 parsed 也没有 content
+            raise ValueError(f"Unable to parse structured response. message={message}")
 
         except BadRequestError as e:
             self.log(
