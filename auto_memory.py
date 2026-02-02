@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.3
+version: 1.3.4
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -1429,29 +1429,43 @@ class Filter:
 
         self.log(f"found {len(expired_records)} expired memories", level="info")
 
-        # Delete each expired memory
         for record in expired_records:
+            expiry_table_deleted = False
+
             try:
-                # Delete from vector database
                 await asyncio.to_thread(
                     self._delete_memory_sync,
                     mem_id=record.mem_id,  # type: ignore
                     user=user,
                 )
-
-                # Delete from expiry table
-                expiry_table.delete_by_mem_id(record.mem_id)  # type: ignore
-
-                stats["deleted"] += 1
                 self.log(
-                    f"deleted expired memory: {record.mem_id[:8]}...", level="debug"
+                    f"deleted memory from vector DB: {record.mem_id[:8]}...",
+                    level="debug",
                 )
-
             except Exception as e:
                 self.log(
-                    f"failed to delete expired memory {record.mem_id}: {e}",
+                    f"failed to delete memory from vector DB {record.mem_id}: {e}. "
+                    f"Memory may have been manually deleted. Continuing to clean up expiry record.",
+                    level="warning",
+                )
+
+            # Always try to delete from expiry table, even if vector DB deletion failed
+            try:
+                expiry_table.delete_by_mem_id(record.mem_id)  # type: ignore
+                expiry_table_deleted = True
+                self.log(
+                    f"deleted expiry record: {record.mem_id[:8]}...", level="debug"
+                )
+            except Exception as e:
+                self.log(
+                    f"failed to delete expiry record {record.mem_id}: {e}",
                     level="error",
                 )
+
+            # Count as deleted if at least expiry table was cleaned up
+            # (vector DB deletion failure is acceptable if memory was already gone)
+            if expiry_table_deleted:
+                stats["deleted"] += 1
 
         self.log(
             f"cleanup complete: deleted {stats['deleted']}/{stats['total']} expired memories",
