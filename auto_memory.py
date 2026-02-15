@@ -5,12 +5,13 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.5
+version: 1.3.6
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
 Compatibility Note:
+- Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
 - Version 1.3.5: Compatible with Open WebUI 0.8.1+
   Memory API signatures updated (db parameter removed from query/add/update operations)
 """
@@ -799,6 +800,11 @@ class Filter:
             ge=1,
             description="extension time when memory is accessed (days). accessed memories will have their expiry extended by this many days.",
         )
+        max_expiry_days: int = Field(
+            default=365,
+            ge=1,
+            description="maximum expiry time for memories (days). prevents memories from being extended indefinitely. accessed memories will not exceed this limit from current time.",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -1483,7 +1489,10 @@ class Filter:
         Boost (extend expiry time) for retrieved memories.
 
         For each memory in related_memories:
-        - If expiry record exists: update expired_at = now + extension_days
+        - If expiry record exists:
+          * Extend expired_at by extension_days from existing expiry
+          * Ensure at least extension_days from now (handles already-expired memories)
+          * Cap at max_expiry_days from now
         - If expiry record doesn't exist: create new record with expired_at = now + initial_expiry_days
 
         Args:
@@ -1511,14 +1520,33 @@ class Filter:
                 existing = expiry_table.get_by_mem_id(memory.mem_id)
 
                 if existing:
-                    # Update existing record
-                    new_expired_at = now_timestamp + (
+                    # Extend expiry from existing expired_at, not from now
+                    # This ensures we truly "extend by N days" rather than "reset to N days from now"
+                    extended_from_existing = int(existing.expired_at) + (  # type: ignore
                         self.valves.extension_days * 86400
                     )
+
+                    # Ensure at least extension_days from now (handles already-expired memories)
+                    extended_from_now = now_timestamp + (
+                        self.valves.extension_days * 86400
+                    )
+
+                    # Take the maximum to ensure we always give at least extension_days
+                    extended_expired_at = max(extended_from_existing, extended_from_now)
+
+                    # Apply maximum expiry limit to prevent indefinite extension
+                    max_allowed_expired_at = now_timestamp + (
+                        self.valves.max_expiry_days * 86400
+                    )
+                    new_expired_at = min(extended_expired_at, max_allowed_expired_at)
+
                     expiry_table.update_expired_at(memory.mem_id, new_expired_at)
                     stats["boosted"] += 1
+
+                    days_extended = (new_expired_at - int(existing.expired_at)) / 86400  # type: ignore
                     self.log(
-                        f"boosted memory {memory.mem_id[:8]}... expiry extended by {self.valves.extension_days} days",
+                        f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
+                        f"(requested {self.valves.extension_days}, capped at {self.valves.max_expiry_days} days from now)",
                         level="debug",
                     )
                 else:
