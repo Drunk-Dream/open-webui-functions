@@ -5,10 +5,14 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.4
-required_open_webui_version: >= 0.5.0
+version: 1.3.5
+required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
+
+Compatibility Note:
+- Version 1.3.5: Compatible with Open WebUI 0.8.1+
+  Memory API signatures updated (db parameter removed from query/add/update operations)
 """
 
 import asyncio
@@ -1340,21 +1344,17 @@ class Filter:
         Returns:
             List of Memory objects filtered by minimum similarity threshold
         """
-        from open_webui.internal.db import get_db
-
         memory_query = self.build_memory_query(messages)
 
         # Query related memories
         try:
-            with get_db() as db:
-                results = await query_memory(
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=QueryMemoryForm(
-                        content=memory_query, k=self.valves.related_memories_n
-                    ),
-                    user=user,
-                    db=db,
-                )
+            results = await query_memory(
+                request=Request(scope={"type": "http", "app": webui_app}),
+                form_data=QueryMemoryForm(
+                    content=memory_query, k=self.valves.related_memories_n
+                ),
+                user=user,
+            )
         except HTTPException as e:
             if e.status_code == 404:
                 self.log("no related memories found", level="info")
@@ -1639,83 +1639,81 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
-        # Create db session for all operations
-        with get_db() as db:
-            # Group actions and define handlers
-            operations: dict[str, dict[str, Any]] = {
-                "delete": {
-                    "actions": [a for a in actions if a.action == "delete"],
-                    "handler": lambda a: delete_memory_by_id(
-                        memory_id=a.id,
-                        request=Request(scope={"type": "http", "app": webui_app}),
-                        user=user,
-                        db=db,
-                    ),
-                    "log_msg": lambda a: f"deleted memory. id={a.id}",
-                    "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
-                    "skip_empty": lambda a: False,
-                    "status_verb": "deleted",
-                },
-                "update": {
-                    "actions": [a for a in actions if a.action == "update"],
-                    "handler": lambda a: update_memory_by_id(
-                        memory_id=a.id,
-                        request=Request(scope={"type": "http", "app": webui_app}),
-                        form_data=MemoryUpdateModel(content=a.new_content),
-                        user=user,
-                        db=db,
-                    ),
-                    "log_msg": lambda a: f"updated memory. id={a.id}",
-                    "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
-                    "skip_empty": lambda a: not a.new_content.strip(),
-                    "status_verb": "updated",
-                },
-                "add": {
-                    "actions": [a for a in actions if a.action == "add"],
-                    "handler": lambda a: add_memory(
-                        request=Request(scope={"type": "http", "app": webui_app}),
-                        form_data=AddMemoryForm(content=a.content),
-                        user=user,
-                        db=db,
-                    ),
-                    "log_msg": lambda a: f"added memory. content={a.content}",
-                    "error_msg": lambda a, e: f"failed to add memory: {e}",
-                    "skip_empty": lambda a: not a.content.strip(),
-                    "status_verb": "saved",
-                },
-            }
+        async def _delete_with_db(action: MemoryDeleteAction) -> None:
+            with get_db() as db:
+                await delete_memory_by_id(
+                    memory_id=action.id,
+                    request=Request(scope={"type": "http", "app": webui_app}),
+                    user=user,
+                    db=db,
+                )
 
-            # Process all operations in order
-            counts = {}
+        # Group actions and define handlers
+        operations: dict[str, dict[str, Any]] = {
+            "delete": {
+                "actions": [a for a in actions if a.action == "delete"],
+                "handler": _delete_with_db,
+                "log_msg": lambda a: f"deleted memory. id={a.id}",
+                "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
+                "skip_empty": lambda a: False,
+                "status_verb": "deleted",
+            },
+            "update": {
+                "actions": [a for a in actions if a.action == "update"],
+                "handler": lambda a: update_memory_by_id(
+                    memory_id=a.id,
+                    request=Request(scope={"type": "http", "app": webui_app}),
+                    form_data=MemoryUpdateModel(content=a.new_content),
+                    user=user,
+                ),
+                "log_msg": lambda a: f"updated memory. id={a.id}",
+                "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
+                "skip_empty": lambda a: not a.new_content.strip(),
+                "status_verb": "updated",
+            },
+            "add": {
+                "actions": [a for a in actions if a.action == "add"],
+                "handler": lambda a: add_memory(
+                    request=Request(scope={"type": "http", "app": webui_app}),
+                    form_data=AddMemoryForm(content=a.content),
+                    user=user,
+                ),
+                "log_msg": lambda a: f"added memory. content={a.content}",
+                "error_msg": lambda a, e: f"failed to add memory: {e}",
+                "skip_empty": lambda a: not a.content.strip(),
+                "status_verb": "saved",
+            },
+        }
 
-            for op_name, op_config in operations.items():
-                counts[op_name] = 0
-                for action in op_config["actions"]:
-                    if op_config["skip_empty"](action):
-                        continue
-                    try:
-                        await op_config["handler"](action)
-                        self.log(op_config["log_msg"](action))
-                        counts[op_name] += 1
+        # Process all operations in order
+        counts = {}
 
-                    except Exception as e:
-                        raise RuntimeError(op_config["error_msg"](action, e))
+        for op_name, op_config in operations.items():
+            counts[op_name] = 0
+            for action in op_config["actions"]:
+                if op_config["skip_empty"](action):
+                    continue
+                try:
+                    await op_config["handler"](action)
+                    self.log(op_config["log_msg"](action))
+                    counts[op_name] += 1
 
-            # Build status message
-            status_parts = []
-            for op_name, op_config in operations.items():
-                count = counts[op_name]
-                if count > 0:
-                    memory_word = "memory" if count == 1 else "memories"
-                    status_parts.append(
-                        f"{op_config['status_verb']} {count} {memory_word}"
-                    )
+                except Exception as e:
+                    raise RuntimeError(op_config["error_msg"](action, e))
 
-            status_message = ", ".join(status_parts)
-            self.log(status_message or "no changes", level="info")
+        # Build status message
+        status_parts = []
+        for op_name, op_config in operations.items():
+            count = counts[op_name]
+            if count > 0:
+                memory_word = "memory" if count == 1 else "memories"
+                status_parts.append(f"{op_config['status_verb']} {count} {memory_word}")
 
-            if status_message and self.user_valves.show_status:
-                await emit_status(status_message, emitter=emitter, status="complete")
+        status_message = ", ".join(status_parts)
+        self.log(status_message or "no changes", level="info")
+
+        if status_message and self.user_valves.show_status:
+            await emit_status(status_message, emitter=emitter, status="complete")
 
     def inlet(
         self,
