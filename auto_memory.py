@@ -5,12 +5,13 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.6
+version: 1.3.7
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
 Compatibility Note:
+- Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
 - Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
 - Version 1.3.5: Compatible with Open WebUI 0.8.1+
   Memory API signatures updated (db parameter removed from query/add/update operations)
@@ -54,6 +55,7 @@ from open_webui.routers.memories import (
     query_memory,
     update_memory_by_id,
 )
+from open_webui.utils.access_control import has_permission
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
@@ -1784,6 +1786,22 @@ class Filter:
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
             raise ValueError("user not found")
+
+        # Check global memories toggle (upstream: ENABLE_MEMORIES config flag)
+        if not webui_app.state.config.ENABLE_MEMORIES:
+            self.log("memories are disabled globally (ENABLE_MEMORIES=False), skipping", level="info")
+            return body
+
+        # Check per-user memories permission (upstream: features.memories permission)
+        if not has_permission(
+            user.id, "features.memories", webui_app.state.config.USER_PERMISSIONS
+        ):
+            self.log(
+                f"user {user.id} does not have 'features.memories' permission, skipping",
+                level="info",
+            )
+            return body
+
         self.current_user = __user__
 
         self.log(f"input user type = {type(__user__)}", level="debug")

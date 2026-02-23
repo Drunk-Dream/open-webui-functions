@@ -26,7 +26,7 @@ class QueryMemoryForm(BaseModel):
     """Form for querying memory."""
 
     content: str
-    k: int = 1
+    k: Optional[int] = 1
 
 
 async def add_memory(

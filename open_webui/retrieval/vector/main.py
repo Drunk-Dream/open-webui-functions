@@ -1,13 +1,15 @@
 """Minimal Open WebUI retrieval.vector.main module."""
 
-from typing import Any
+from typing import Any, List, Optional
+
+from pydantic import BaseModel
 
 
-class SearchResult:
-    """Search result from vector database."""
+class GetResult(BaseModel):
+    ids: Optional[List[List[str]]] = None
+    documents: Optional[List[List[str]]] = None
+    metadatas: Optional[List[List[Any]]] = None
 
-    def __init__(self):
-        self.ids: list[list[str]] = [[]]
-        self.documents: list[list[str]] = [[]]
-        self.metadatas: list[list[dict[str, Any]]] = [[]]
-        self.distances: list[list[float]] | None = None
+
+class SearchResult(GetResult):
+    distances: Optional[List[List[float | int]]] = None
