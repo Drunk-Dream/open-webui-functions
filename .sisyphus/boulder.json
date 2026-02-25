@@ -1,12 +1,10 @@
 {
-  "active_plan": "/home/dongmh/source/open-webui-functions/.sisyphus/plans/memory-decay-refactor.md",
-  "started_at": "2026-01-30T09:11:18.538Z",
-  "completed_at": "2026-01-30T09:45:00.000Z",
+  "active_plan": "/Users/dongmh/Documents/source/open-webui-functions/.sisyphus/plans/auto-memory-function-calling-refactor.md",
+  "started_at": "2026-02-25T14:07:29.278Z",
   "session_ids": [
-    "ses_3f1e91bc4ffeB77vVqGo5JaOh0"
+    "ses_36adfae40ffe9EQEYm7RAsfhZs",
+    "ses_36ac0e0fdffe4VL2HmuHoFg9LF"
   ],
-  "plan_name": "memory-decay-refactor",
-  "status": "completed",
-  "tasks_completed": 6,
-  "tasks_total": 6
+  "plan_name": "auto-memory-function-calling-refactor",
+  "agent": "atlas"
 }
