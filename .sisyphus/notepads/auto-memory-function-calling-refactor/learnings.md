@@ -352,3 +352,20 @@ All 6 task deliverables present and verified. No scope creep. No forbidden remna
 - Test now triggers real planner path: client.chat.completions.create returns make_no_tool_call_response(), real query_openai_sdk validates and raises ValueError at auto_memory.py:880.
 - Mutation guard (mock_delete) remains in place to confirm no mutations occur on failure path.
 - All 4 tests pass cleanly in 0.38s.
+
+## 2026-02-25 — Dead helper cleanup
+
+- Removed `_strip_json_fences` (lines 773-814) and `_schema_instructions_for` (lines 816-826) from `query_openai_sdk`.
+- Both were nested helpers inside `query_openai_sdk` that became dead code after strict tool-calling migration (commit 7483eca).
+- No call sites existed; grep confirmed zero references after removal.
+- `uv run python -m py_compile auto_memory.py` passes cleanly.
+- `uv run pytest -q tests/test_auto_memory_function_calling.py` passes all 4 tests in 0.34s.
+
+
+## 2026-02-25 — Version bump to 1.4.0
+
+- Updated `pyproject.toml` version to `1.4.0`.
+- Updated `auto_memory.py` header metadata version to `1.4.0`.
+- Added compatibility note for 1.4.0: "Refactored function calling implementation for improved reliability and maintainability".
+- Verification: `uv run python -m py_compile auto_memory.py` passes cleanly.
+- Verification: `uv run pytest -q tests/test_auto_memory_function_calling.py` passes all 4 tests in 0.36s.

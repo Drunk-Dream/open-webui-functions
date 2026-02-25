@@ -52,3 +52,8 @@
 
 - No new issues introduced. Test now exercises real query_openai_sdk implementation and validates hard-fail behavior on no-tool-calls response.
 - Pre-existing F2 medium finding (dead nested helpers) remains unchanged; out of scope for this task.
+
+## 2026-02-25 — Dead helper cleanup
+
+- No new issues introduced. Both helpers removed cleanly.
+- Pre-existing F2 medium finding (dead nested helpers) is now resolved.

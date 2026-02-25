@@ -5,12 +5,13 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.3.7
+version: 1.4.0
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
 Compatibility Note:
+- Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
 - Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
 - Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
 - Version 1.3.5: Compatible with Open WebUI 0.8.1+
@@ -769,61 +770,6 @@ class Filter:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
-
-        def _strip_json_fences(text: str) -> str:
-            """Strip markdown code fences from JSON response.
-
-            Handles various fence formats:
-            - ```json\n{...}\n```
-            - ```\n{...}\n```
-            - ``` json\n{...}\n```
-            """
-            stripped = text.strip()
-
-            # Try regex patterns with greedy matching
-            patterns = [
-                r"^```json\s*\n?(.*?)```$",  # ```json ... ```
-                r"^```\s*json\s*\n?(.*?)```$",  # ``` json ... ```
-                r"^```\s*\n?(.*?)```$",  # ``` ... ```
-            ]
-
-            for pattern in patterns:
-                match = re.search(pattern, stripped, flags=re.IGNORECASE | re.DOTALL)
-                if match:
-                    return match.group(1).strip()
-
-            # Fallback: line-by-line stripping
-            lines = stripped.split("\n")
-
-            # Remove opening fence (first line if it starts with ```)
-            if lines and lines[0].strip().startswith("```"):
-                lines = lines[1:]
-
-            # Remove closing fence (last line if it starts with ```)
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-
-            result = "\n".join(lines).strip()
-
-            # Final check: if still starts/ends with ```, do character-level strip
-            if result.startswith("```"):
-                result = re.sub(r"^```\w*\s*\n?", "", result, flags=re.IGNORECASE)
-            if result.endswith("```"):
-                result = re.sub(r"\n?\s*```\s*$", "", result)
-
-            return result.strip()
-
-        def _schema_instructions_for(model: Type[BaseModel]) -> str:
-            schema_json = json.dumps(
-                model.model_json_schema(),
-                ensure_ascii=False,
-                indent=2,
-            )
-            return (
-                "Return ONLY valid JSON (no markdown, no code fences) that conforms to this JSON Schema. "
-                "Do not include any extra keys. If a field is unknown, omit it unless required.\n\n"
-                f"JSON Schema:\n{schema_json}"
-            )
 
         if response_model is None:
             request_args: dict[str, Any] = {
