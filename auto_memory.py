@@ -21,7 +21,6 @@ Compatibility Note:
 import asyncio
 import json
 import logging
-import re
 import threading
 from datetime import datetime
 from typing import (
@@ -606,10 +605,6 @@ class Filter:
             default=False,
             description="SECURITY WARNING: allow users to override API URL/model without providing their own API key. this could allow users to steal your API key or use expensive models at your expense. only enable if you trust all users.",
         )
-        override_memory_context: bool = Field(
-            default=False,
-            description="intercept and override memory context injection in system prompts. when enabled, allows customization of how memories are presented to the model.",
-        )
         debug_mode: bool = Field(
             default=False,
             description="enable debug logging",
@@ -870,108 +865,6 @@ class Filter:
                 )
             finally:
                 loop.close()
-
-    def extract_memory_context(self, content: str) -> Optional[tuple[str, list[dict]]]:
-        """
-        Extract memory context from system message content.
-
-        Returns:
-            tuple of (full_match_string, parsed_memories_list) if found, None otherwise
-        """
-        # Open WebUI uses this standard format
-        pattern = r"<memory_user_context>\s*(\[[\s\S]*?\])\s*</memory_user_context>"
-        match = re.search(pattern, content)
-
-        if not match:
-            self.log("no memory context found in system message", level="debug")
-            return None
-
-        try:
-            memories_json = match.group(1)
-            memories_list = json.loads(memories_json)
-            self.log(
-                f"extracted {len(memories_list)} memories from context", level="debug"
-            )
-            return (match.group(0), memories_list)
-        except json.JSONDecodeError as e:
-            self.log(
-                f"failed to parse memory context JSON: {e}. raw content: {match.group(1)[:200]}...",
-                level="error",
-            )
-            return None
-
-    def format_memory_context(self, memories: list[dict]) -> str:
-        """
-        Format memories into the memory context string.
-        Override this method to customize how memories are presented.
-
-        Args:
-            memories: List of memory objects with 'content', 'created_at', 'updated_at', 'similarity_score'
-
-        Returns:
-            Formatted memory context string to inject into system prompt
-        """
-        # Remove similarity_score from each memory
-        memories = [
-            {k: v for k, v in mem.items() if k != "similarity_score"}
-            for mem in memories
-        ]
-
-        # Format with custom XML tag
-        memories_json = json.dumps(memories, indent=2, ensure_ascii=False)
-        return f"<long_term_memory>\n{memories_json}\n</long_term_memory>"
-
-    def process_memory_context_in_messages(self, messages: list[dict]) -> list[dict]:
-        """
-        Process messages to intercept and optionally override memory context.
-
-        Args:
-            messages: List of message dicts from the body
-
-        Returns:
-            Modified messages list
-        """
-        found_any_memory_context = False
-
-        # Find system message(s)
-        for i, message in enumerate(messages):
-            if message.get("role") != "system":
-                continue
-
-            content = message.get("content", "")
-            if not content:
-                continue
-
-            # Try to extract existing memory context
-            extraction_result = self.extract_memory_context(content)
-
-            if extraction_result:
-                found_any_memory_context = True
-                full_match, memories_list = extraction_result
-
-                # Override: format the memories using custom method
-                new_context = self.format_memory_context(memories_list)
-
-                # Replace in content
-                messages[i]["content"] = content.replace(full_match, new_context)
-
-                # Log successful override
-                self.log(
-                    f"overrode memory context in system message {i}: {len(memories_list)} memories processed, "
-                    f"similarity scores removed, XML tag changed to <long_term_memory>",
-                    level="info",
-                )
-            else:
-                self.log(f"no memory context in system message {i}", level="debug")
-
-        # If valve is enabled and we didn't find any memory context, that's unusual
-        if not found_any_memory_context:
-            self.log(
-                "memory context override is enabled but no <memory_user_context> found in any system message",
-                level="warning",
-            )
-
-        return messages
 
     def get_restricted_user_valve(
         self,
@@ -1420,10 +1313,10 @@ class Filter:
             )
 
         except Exception as e:
-            self.log(f"LLM query failed: {e}", level="error")
+            self.log(f"memory planning failed: {e}", level="error")
             if self.user_valves.show_status:
                 await emit_status(
-                    "memory processing failed", emitter=emitter, status="error"
+                    "memory planning failed", emitter=emitter, status="error"
                 )
             return None
 
@@ -1513,7 +1406,9 @@ class Filter:
                     counts[op_name] += 1
 
                 except Exception as e:
-                    raise RuntimeError(op_config["error_msg"](action, e))
+                    raise RuntimeError(
+                        f"memory action failed: {op_config['error_msg'](action, e)}"
+                    )
 
         # Build status message
         status_parts = []
@@ -1540,15 +1435,6 @@ class Filter:
             f"inlet: user ID: {__user__.get('id') if __user__ else 'no user'}",
             level="debug",
         )
-
-        # Process memory context interception if enabled
-        if self.valves.override_memory_context and "messages" in body:
-            try:
-                body["messages"] = self.process_memory_context_in_messages(
-                    body["messages"]
-                )
-            except Exception as e:
-                self.log(f"error processing memory context: {e}", level="error")
 
         return body
 

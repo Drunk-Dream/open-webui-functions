@@ -369,3 +369,16 @@ All 6 task deliverables present and verified. No scope creep. No forbidden remna
 - Added compatibility note for 1.4.0: "Refactored function calling implementation for improved reliability and maintainability".
 - Verification: `uv run python -m py_compile auto_memory.py` passes cleanly.
 - Verification: `uv run pytest -q tests/test_auto_memory_function_calling.py` passes all 4 tests in 0.36s.
+## 2026-02-26 — Exception log wording optimization
+
+- Replaced generic `"LLM query failed: {e}"` at line 1423 with `"memory planning failed: {e}"` to distinguish planning-phase failures from action-application failures.
+- Replaced generic `RuntimeError(op_config["error_msg"](action, e))` at line 1516 with `RuntimeError(f"memory action failed: {op_config['error_msg'](action, e)}")` to prefix action-execution errors with clear context.
+- Status message text remains unchanged: `"memory planning failed"` for planning errors, `"memory processing failed"` for action errors (inherited from outer catch).
+- Verification: `uv run python -m py_compile auto_memory.py` passes cleanly.
+- Verification: `uv run pytest -q tests/test_auto_memory_function_calling.py` passes all 4 tests in 0.36s.
+
+## 2026-02-26 — Removed memory-context override valve/path
+
+- Deleted `override_memory_context` from `Filter.Valves` and removed the `inlet()` branch that mutated incoming system messages.
+- Removed dead helpers exclusively tied to this feature: `extract_memory_context`, `format_memory_context`, and `process_memory_context_in_messages`.
+- `inlet()` now returns the request body unchanged, so system memory context is no longer intercepted/reformatted.

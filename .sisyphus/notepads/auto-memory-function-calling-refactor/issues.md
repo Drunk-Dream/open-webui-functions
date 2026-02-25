@@ -57,3 +57,12 @@
 
 - No new issues introduced. Both helpers removed cleanly.
 - Pre-existing F2 medium finding (dead nested helpers) is now resolved.
+
+## 2026-02-26 — Exception log wording optimization
+
+- No new issues introduced. All pre-existing LSP errors remain unchanged.
+
+## 2026-02-26 — Removed memory-context override valve/path
+
+- No new task-scoped issues introduced.
+- Behavioral change is intentional: `inlet()` no longer rewrites `<memory_user_context>` blocks in system messages.
