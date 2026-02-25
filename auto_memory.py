@@ -38,7 +38,7 @@ from typing import (
 
 from fastapi import HTTPException, Request
 from openai import BadRequestError, OpenAI
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from sqlalchemy import BigInteger, Column, Index, String
 from sqlalchemy.orm import Session
 
@@ -63,19 +63,22 @@ STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
 
 
 UNIFIED_SYSTEM_PROMPT = """\
-You are maintaining a collection of Memories - individual "journal entries" or facts about a user, each automatically timestamped upon creation or update.
+You maintain a collection of Memories: individual facts or journal entries about a user, each automatically timestamped on creation or update.
 
-You will be provided with:
-1. Recent messages from a conversation (displayed with negative indices; -1 is the most recent overall message)
-2. Any existing related memories that might potentially be relevant
+Your only job here is to decide what memory actions to take. You must call the `memory_actions` tool exactly once. Do not write any normal text response.
 
-Your job is to determine what actions to take on the memory collection based on the User's **latest** message (-2).
+<output_rules>
+- Call `memory_actions` exactly once.
+- Set `actions` to an empty list when no changes are needed.
+- Never output plain text. The tool call is your entire response.
+- Never store credentials, passwords, API keys, tokens, or any secrets.
+</output_rules>
 
 <key_instructions>
 ## Instructions
-1. Focus ONLY on the **User's most recent message** (-2). Older messages provide context but should not generate new memories unless explicitly referenced in the latest message.
+1. Focus ONLY on the **latest user message** (the most recent message with role=user). Older messages provide context but should not generate new memories unless explicitly referenced in the latest message.
 2. Each Memory should represent **a single fact or statement**. Never combine multiple facts into one Memory.
-3. When the User's latest message contradicts existing memories, **update the existing memory** rather than creating a conflicting new one.
+3. When the latest user message contradicts existing memories, **update the existing memory** rather than creating a conflicting new one.
 4. If memories are exact duplicates or direct conflicts about the same topic, **consolidate them by updating or deleting** as appropriate.
 5. **Link related Memories** by including brief references when relevant to maintain semantic connections.
 6. Capture anything valuable for **personalizing future interactions** with the User.
@@ -109,10 +112,11 @@ Your job is to determine what actions to take on the memory collection based on 
 - Temporary activities
 - Sarcastic remarks or obvious jokes
 - Non-literal statements or hyperbole
+- Credentials, passwords, API keys, tokens, or any secrets
 </what_not_to_extract>
 
 <actions_to_take>
-Based on your analysis, return a list of actions:
+Based on your analysis, call `memory_actions` with a list of actions:
 
 **ADD**: Create new memory when:
 - New information not covered by existing memories
@@ -180,238 +184,34 @@ If an existing memory wrongly combines separable facts: UPDATE the existing memo
 </consolidation_rules>
 
 <examples>
-**Example 1 - Store new memories when no related found**
-Conversation:
--2. user: ```I work as a senior data scientist at Tesla and my favorite programming language is Rust```
--1. assistant: ```That's impressive! Working at Tesla must be exciting, and Rust is a great choice for systems programming```
+**Example 1 - Add new facts, no conflicts**
+Input:
+LATEST_USER_MESSAGE:
+I work as a senior data scientist at Tesla and my favorite language is Rust
 
-Related Memories:
-[
-  {"mem_id": "1", "created_at": "2024-01-05T10:00:00", "update_at": "2024-01-05T10:00:00", "content": "User enjoys electric vehicles"},
-  {"mem_id": "2", "created_at": "2024-02-10T14:00:00", "update_at": "2024-02-10T14:00:00", "content": "User has experience with Python and data analysis"},
-  {"mem_id": "3", "created_at": "2024-01-20T09:30:00", "update_at": "2024-01-20T09:30:00", "content": "User likes reading science fiction novels"}
-]
+RECENT_CONVERSATION_SNIPPET:
+user: I work as a senior data scientist at Tesla and my favorite language is Rust
+assistant: That's impressive! Rust is a great choice.
 
-**Analysis**
-- Existing memories might be tangentially related (electric vehicles/Tesla, data analysis) but don't actually cover the specific facts mentioned
-- User provides two distinct new facts: job/company and programming preference
-- Each should be stored as a separate new memory
+RELATED_MEMORIES_JSON:
+[{"mem_id": "1", "created_at": "2024-01-05T10:00:00", "update_at": "2024-01-05T10:00:00", "content": "User enjoys electric vehicles"}]
 
-Output:
-{
-  "actions": [
-    {"action": "add", "content": "User works as a senior data scientist at Tesla"},
-    {"action": "add", "content": "User's favorite programming language is Rust"}
-  ]
-}
+Tool call: memory_actions({"actions": [{"action": "add", "content": "User works as a senior data scientist at Tesla"}, {"action": "add", "content": "User's favorite programming language is Rust"}]})
 
-**Example 2 - Consolidate similar memories while retaining context**
-Conversation:
--2. user: ```Actually I prefer TypeScript over JavaScript for frontend work these days```
--1. assistant: ```TypeScript's type safety definitely makes frontend development more maintainable!```
+**Example 2 - No change needed (sarcasm/joke)**
+Input:
+LATEST_USER_MESSAGE:
+I'm basically a human calculator!
 
-Related Memories:
-[
-  {"mem_id": "123", "created_at": "2024-01-15T10:00:00", "update_at": "2024-01-15T10:00:00", "content": "User likes JavaScript for web development"},
-  {"mem_id": "456", "created_at": "2024-02-20T14:30:00", "update_at": "2024-02-20T14:30:00", "content": "User prefers JavaScript for frontend projects"},
-  {"mem_id": "789", "created_at": "2024-03-01T09:00:00", "update_at": "2024-03-01T09:00:00", "content": "User is learning React"}
-]
+RECENT_CONVERSATION_SNIPPET:
+assistant: I can perform complex calculations in seconds.
+user: I'm basically a human calculator!
+assistant: 😂 Sure you can!
 
-**Analysis**
-- Two existing similar memories about JavaScript preference
-- User said they now prefer TypeScript, but it doesn't mean they don't *like* JavaScript anymore
-- Update one memory to reflect the new preference, leave all other memories untouched
-
-Output:
-{
-  "actions": [
-    {"action": "update", "id": "456", "new_content": "User prefers TypeScript for frontend work"}
-  ]
-}
-
-**Example 3 - Delete conflicting memory while retaining others**
-Conversation:
--2. user: ```I'm joking! I didn't actually buy the iPhone!```
--1. assistant: ```Ahh, you got me there! No worries.```
-
-Related Memories:
-[
-  {"mem_id": "789", "created_at": "2024-03-01T09:00:00", "update_at": "2024-03-01T09:00:00", "content": "User just bought a new iPhone"},
-  {"mem_id": "012", "created_at": "2024-03-02T11:00:00", "update_at": "2024-03-02T11:00:00", "content": "User likes Apple products"},
-  {"mem_id": "345", "created_at": "2024-03-02T11:00:00", "update_at": "2024-03-02T11:00:00", "content": "User is considering buying a new iPad"}
-]
-
-**Analysis**
-- User negates a previous statement about buying an iPhone
-- We should delete the memory about the iPhone purchase
-- The other memories about liking Apple products and considering an iPad remain valid
-
-Output:
-{
-  "actions": [
-    {"action": "delete", "id": "789"}
-  ]
-}
-
-**Example 4 - Handling multiple updates while retaining context**
-Conversation:
--4. user: ```I'm thinking of switching from my current role```
--3. assistant: ```What's motivating you to consider a change?```
--2. user: ```Well, I got promoted to team lead last month, but I'm also interviewing at Google next week. The commute would be better since I just moved to Mountain View```
--1. assistant: ```Congratulations on the promotion! That's interesting timing with the Google interview```
-
-Related Memories:
-[
-  {"mem_id": "345", "created_at": "2024-02-15T10:00:00", "update_at": "2024-02-15T10:00:00", "content": "User lives in San Francisco"},
-  {"mem_id": "678", "created_at": "2024-01-10T08:00:00", "update_at": "2024-01-10T08:00:00", "content": "User works as a software engineer"}
-]
-
-**Analysis**
-- User reveals: promoted to team lead (updates role), moved to Mountain View (conflicts with SF), interviewing at Google (new info)
-- We don't want to forget any of the user's life details, unless there is a conflict. So we create a new memory, and update the legacy ones.
-- Add new memory about Google interview as it's distinct future event
-
-Output:
-{
-  "actions": [
-    {"action": "update", "id": "345", "new_content": "User used to live in San Francisco"},
-    {"action": "update", "id": "678", "new_content": "User works as a team lead software engineer"},
-    {"action": "add", "content": "User got promoted to team lead"},
-    {"action": "add", "content": "User has just moved to Mountain View"},
-    {"action": "add", "content": "User lives in Mountain View"},
-    {"action": "add", "content": "User has an interview at Google"}
-  ]
-}
-
-**Example 5 - Handling sarcasm and non-literal language**
-Conversation:
--3. assistant: ```As an AI assistant, I can perform extremely complex calculations in seconds.```
--2. user: ```Oh yeah? I can do that with my eyes closed! I'm basically a human calculator!```
--1. assistant: ```😂 Sure you can!```
-
-Related Memories:
+RELATED_MEMORIES_JSON:
 []
 
-**Analysis**
-- The User's message is clearly sarcastic/joking - they're not literally claiming to be a human calculator
-- This is hyperbole used for humorous effect, not a factual statement about their abilities
-- No memories should be created from obvious sarcasm or jokes
-
-Output:
-{
-  "actions": []
-}
-
-**Example 6 - Cross-message context linking**
-Conversation:
--5. assistant: ```How's your new TV working out?```
--4. user: ```Remember how I bought that Samsung OLED TV last week?```
--3. assistant: ```Yes, I remember that. What about it?```
--2. user: ```Well, it broke down today! The screen just went black.```
--1. assistant: ```Oh no! That's terrible for such a new TV!```
-
-Related Memories:
-[
-  {"mem_id": "101", "created_at": "2024-03-15T10:00:00", "update_at": "2024-03-15T10:00:00", "content": "User bought a Samsung OLED TV"}
-]
-
-**Analysis**
-- The User's latest message provides new information about the TV breaking
-- We need to create a self-contained memory that includes context from earlier messages
-- The new memory should reference the Samsung OLED TV specifically, not just "it" or "the TV"
-- This helps semantically link to the existing memory about the purchase
-
-Output:
-{
-  "actions": [
-    {"action": "add", "content": "User's Samsung OLED TV, that was recently purchased, just broke down with a black screen"}
-  ]
-}
-
-**Example 7 - Memory maintenance: merging and deleting duplicates and bad memories**
-Conversation:
--2. user: ```Can you help me write a Python function to sort a list?```
--1. assistant: ```Of course! Here's a simple example using sorted()...```
-
-Related Memories:
-[
-  {"mem_id": "234", "created_at": "2024-02-10T09:00:00", "update_at": "2024-02-10T09:00:00", "content": "User prefers Python for scripting"},
-  {"mem_id": "567", "created_at": "2024-03-15T14:30:00", "update_at": "2024-03-15T14:30:00", "content": "User likes Python for scripting tasks"},
-  {"mem_id": "890", "created_at": "2024-01-05T10:00:00", "update_at": "2024-01-05T10:00:00", "content": "User knows Python programming"},
-  {"mem_id": "123", "created_at": "2024-01-10T11:00:00", "update_at": "2024-01-10T11:00:00", "content": "User's name is Jake"},
-  {"mem_id": "456", "created_at": "2024-01-15T08:00:00", "update_at": "2024-01-15T08:00:00", "content": "User's cat is named Luna"},
-  {"mem_id": "789", "created_at": "2024-02-20T10:00:00", "update_at": "2024-02-20T10:00:00", "content": "User's cat is a Siamese"}
-]
-
-**Analysis**
-- The current conversation is just a technical question about Python - no new personal information
-- However, the related memories show issues that need maintenance. We apply the relevant Memory rules:
-  1. **Delete bad memory**: Memory 123 contains the user's name, which violates the rule "never store user/assistant names" - should be deleted
-  2. **Delete duplicate**: Memory 234 and 567 express essentially the same preference (Python for scripting) - keep older (234), delete newer duplicate (567)
-  3. **Merge inseparable facts**: Memory 456 and 789 are about the same cat and should ALWAYS be retrieved together (cat's name + breed) - merge into oldest memory (456)
-- Memory 890 is distinct (knowledge vs preference) so it should remain
-
-Output:
-{
-  "actions": [
-    {"action": "delete", "id": "123"},
-    {"action": "delete", "id": "567"},
-    {"action": "update", "id": "456", "new_content": "User has a Siamese cat named Luna"},
-    {"action": "delete", "id": "789"}
-  ]
-}
-
-**Example 8 - Explicit memory request**
-Conversation:
--4. user: ```Hey, do you remember what my dog's name is?```
--3. assistant: ```I don't have that information. Could you tell me?```
--2. user: ```Sure! His name is Max and he's a golden retriever.```
--1. assistant: ```What a lovely name! Max sounds like a wonderful companion. I'll remember that.```
-
-Related Memories:
-[
-  {"mem_id": "111", "created_at": "2024-01-20T10:00:00", "update_at": "2024-01-20T10:00:00", "content": "User loves dogs"}
-]
-
-**Analysis**
-- Assistant explicitly expresses intent to remember something. We ALWAYS honor explicit memory requests.
-- User provides info about his dog's name and breed these can be stored as a single memory as they are closely related
-- The existing memory about loving dogs is related but doesn't conflict
-
-Output:
-{
-  "actions": [
-    {"action": "add", "content": "User has a golden retriever named Max"}
-  ]
-}
-
-**Example 9 - Memory maintenance: splitting and adding context**
-Conversation:
--2. user: ```Sadie invited me to her birthday party next week, I'm excited!```
--1. assistant: ```That's wonderful! I hope you have a great time at Sadie's party.```
-
-Related Memories:
-[
-  {"mem_id": "555", "created_at": "2024-02-10T10:00:00", "update_at": "2024-02-10T10:00:00", "content": "User has an old time friend named Sadie who they grew up with, and whose mother is a long time friend of User's mother"},
-  {"mem_id": "666", "created_at": "2024-02-12T14:00:00", "update_at": "2024-02-12T14:00:00", "content": "The two mothers also did their english courses together"}
-]
-
-**Analysis**
-- User mentions Sadie's party (new event to store)
-- Memory 555 combines two separable facts: User's friendship with Sadie (including growing up together), and the mothers' friendship
-- Memory 666 lacks clear context - "the two mothers" is ambiguous without memory 555
-- This is a **passive maintenance scenario**: even though the conversation doesn't directly discuss the memory issues, we should fix them
-- Actions: update 555 to remove the mothers' friendship, add new memory for mothers' relationship, add context to 666
-
-Output:
-{
-  "actions": [
-    {"action": "add", "content": "User is invited to Sadie's birthday party next week"},
-    {"action": "update", "id": "555", "new_content": "User has an old friend named Sadie who they grew up with"},
-    {"action": "add", "content": "User's mother and Sadie's mother are long time friends"},
-    {"action": "update", "id": "666", "new_content": "User's mother and Sadie's mother did their english courses together"}
-  ]
-}
+Tool call: memory_actions({"actions": []})
 </examples>\
 """
 
@@ -439,23 +239,27 @@ async def emit_status(
     )
 
 
-class MemoryAddAction(BaseModel):
+class StrictBaseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class MemoryAddAction(StrictBaseModel):
     action: Literal["add"] = Field(..., description="Action type (add)")
     content: str = Field(..., description="Content of the memory to add")
 
 
-class MemoryUpdateAction(BaseModel):
+class MemoryUpdateAction(StrictBaseModel):
     action: Literal["update"] = Field(..., description="Action type (update)")
     id: str = Field(..., description="ID of the memory to update")
     new_content: str = Field(..., description="New content for the memory")
 
 
-class MemoryDeleteAction(BaseModel):
+class MemoryDeleteAction(StrictBaseModel):
     action: Literal["delete"] = Field(..., description="Action type (delete)")
     id: str = Field(..., description="ID of the memory to delete")
 
 
-class MemoryActionRequestStub(BaseModel):
+class MemoryActionRequestStub(StrictBaseModel):
     """This is a stub model to correctly type parameters. Not used directly."""
 
     actions: list[Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]] = (
@@ -501,7 +305,7 @@ def build_actions_request_model(existing_ids: list[str]):
                     max_length=20,
                 ),
             ),
-            __base__=BaseModel,
+            __base__=StrictBaseModel,
         )
     else:
         id_literal_type = Literal[tuple(existing_ids)]  # type: ignore[misc,valid-type]
@@ -532,8 +336,25 @@ def build_actions_request_model(existing_ids: list[str]):
                     max_length=20,
                 ),
             ),
-            __base__=BaseModel,
+            __base__=StrictBaseModel,
         )
+
+
+def build_memory_actions_tool(
+    existing_ids: list[str],
+) -> tuple[Type[BaseModel], dict[str, Any], dict[str, Any]]:
+    request_model = build_actions_request_model(existing_ids)
+    tool_definition: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "memory_actions",
+            "description": "Generate the complete memory action plan for this request.",
+            "strict": True,
+            "parameters": request_model.model_json_schema(),
+        },
+    }
+    tool_choice = {"type": "function", "function": {"name": "memory_actions"}}
+    return request_model, tool_definition, tool_choice
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -881,6 +702,8 @@ class Filter:
         system_prompt: str,
         user_message: str,
         response_model: Type[R],
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[dict[str, Any]] = None,
     ) -> R: ...
 
     @overload
@@ -889,14 +712,18 @@ class Filter:
         system_prompt: str,
         user_message: str,
         response_model: None = None,
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[dict[str, Any]] = None,
     ) -> str: ...
 
     async def query_openai_sdk(
         self,
         system_prompt: str,
         user_message: str,
-        response_model: Optional[Type[R]] = None,
-    ) -> Union[str, R]:
+        response_model: Optional[type[BaseModel]] = None,
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[dict[str, Any]] = None,
+    ) -> Union[str, BaseModel]:
         """Generic wrapper around OpenAI chat completions.
 
         Behavior:
@@ -1000,12 +827,17 @@ class Filter:
             )
 
         if response_model is None:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                **extra_args,  # pyright: ignore[reportArgumentType]
-            )
+            request_args: dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                **extra_args,
+            }
+            if tools is not None:
+                request_args["tools"] = cast(Any, tools)
+            if tool_choice is not None:
+                request_args["tool_choice"] = cast(Any, tool_choice)
+            response = client.chat.completions.create(**request_args)
             self.log(f"sdk response: {response}", level="debug")
 
             text_response = response.choices[0].message.content
@@ -1014,18 +846,39 @@ class Filter:
 
             return text_response
 
-        response_model = cast(Type[R], response_model)
+        model_cls = cast(Any, response_model)
         self.log(
-            f"attempting structured outputs with {response_model.__name__}",
+            f"attempting structured outputs with {model_cls.__name__}",
             level="debug",
         )
+
+        if tools:
+            request_args: dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "tools": cast(Any, tools),
+                **extra_args,
+            }
+            if tool_choice is not None:
+                request_args["tool_choice"] = cast(Any, tool_choice)
+            response = client.chat.completions.create(**request_args)
+            message = response.choices[0].message
+            if not message.tool_calls:
+                raise ValueError("no tool call returned for structured action plan")
+
+            tool_call = message.tool_calls[0]
+            if tool_call.function.name != "memory_actions":
+                raise ValueError(f"unexpected tool name: {tool_call.function.name}")
+
+            return model_cls.model_validate_json(tool_call.function.arguments)
 
         try:
             response = client.chat.completions.parse(
                 model=model_name,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=temperature,
-                response_format=response_model,
+                response_format=cast(Any, response_model),
                 **extra_args,  # pyright: ignore[reportArgumentType]
             )
 
@@ -1033,7 +886,7 @@ class Filter:
 
             # 1. 优先使用 SDK 自动解析的结果
             if message.parsed:
-                return cast(R, message.parsed)
+                return cast(BaseModel, message.parsed)
 
             # 2. 如果自动解析失败（parsed is None），检查是否有拒绝对话（Refusal）
             if getattr(message, "refusal", None):
@@ -1055,7 +908,7 @@ class Filter:
 
                 # 手动调用 Pydantic 的验证方法
                 # 注意：如果 JSON 依然非法，这里会抛出 ValidationError，建议根据需要决定是否捕获
-                return response_model.model_validate_json(cleaned)
+                return model_cls.model_validate_json(cleaned)
 
             # 4. 既没有 parsed 也没有 content
             raise ValueError(f"Unable to parse structured response. message={message}")
@@ -1068,7 +921,10 @@ class Filter:
 
             fallback_messages: list[dict[str, str]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "system", "content": _schema_instructions_for(response_model)},
+                {
+                    "role": "system",
+                    "content": _schema_instructions_for(model_cls),
+                },
                 {"role": "user", "content": user_message},
             ]
 
@@ -1089,7 +945,7 @@ class Filter:
             )
             cleaned = _strip_json_fences(text_response)
             self.log(f"cleaned after stripping: {cleaned[:200]}...", level="debug")
-            return response_model.model_validate_json(cleaned)
+            return model_cls.model_validate_json(cleaned)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1618,14 +1474,30 @@ class Filter:
             [memory.model_dump(mode="json") for memory in related_memories]
         )
         conversation_str = self.messages_to_string(messages)
+        latest_user_message = next(
+            (
+                m.get("content", "")
+                for m in reversed(messages)
+                if m.get("role") == "user"
+            ),
+            "",
+        )
+        planning_input = (
+            f"LATEST_USER_MESSAGE:\n{latest_user_message}\n\n"
+            f"RECENT_CONVERSATION_SNIPPET:\n{conversation_str}\n\n"
+            f"RELATED_MEMORIES_JSON:\n{stringified_memories}"
+        )
 
         try:
+            request_model, tool_definition, tool_choice = build_memory_actions_tool(
+                [m.mem_id for m in related_memories]
+            )
             action_plan = await self.query_openai_sdk(
                 system_prompt=UNIFIED_SYSTEM_PROMPT,
-                user_message=f"Conversation snippet:\n{conversation_str}\n\nRelated Memories:\n{stringified_memories}",
-                response_model=build_actions_request_model(
-                    [m.mem_id for m in related_memories]
-                ),
+                user_message=planning_input,
+                response_model=request_model,
+                tools=[tool_definition],
+                tool_choice=tool_choice,
             )
             self.log(f"action plan: {action_plan}", level="debug")
 
@@ -1789,7 +1661,10 @@ class Filter:
 
         # Check global memories toggle (upstream: ENABLE_MEMORIES config flag)
         if not webui_app.state.config.ENABLE_MEMORIES:
-            self.log("memories are disabled globally (ENABLE_MEMORIES=False), skipping", level="info")
+            self.log(
+                "memories are disabled globally (ENABLE_MEMORIES=False), skipping",
+                level="info",
+            )
             return body
 
         # Check per-user memories permission (upstream: features.memories permission)
