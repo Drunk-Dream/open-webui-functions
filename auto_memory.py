@@ -37,7 +37,7 @@ from typing import (
 )
 
 from fastapi import HTTPException, Request
-from openai import BadRequestError, OpenAI
+from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
 from sqlalchemy import BigInteger, Column, Index, String
 from sqlalchemy.orm import Session
@@ -312,14 +312,17 @@ def build_actions_request_model(existing_ids: list[str]):
 
         DynamicMemoryUpdateAction = create_model(
             "MemoryUpdateAction",
+            action=(Literal["update"], ...),
             id=(id_literal_type, ...),  # type: ignore[valid-type]
-            __base__=MemoryUpdateAction,
+            new_content=(str, ...),
+            __base__=StrictBaseModel,
         )
 
         DynamicMemoryDeleteAction = create_model(
             "MemoryDeleteAction",
+            action=(Literal["delete"], ...),
             id=(id_literal_type, ...),  # type: ignore[valid-type]
-            __base__=MemoryDeleteAction,
+            __base__=StrictBaseModel,
         )
 
         AllowedActions = Union[  # type: ignore[valid-type]
@@ -343,18 +346,17 @@ def build_actions_request_model(existing_ids: list[str]):
 def build_memory_actions_tool(
     existing_ids: list[str],
 ) -> tuple[Type[BaseModel], dict[str, Any], dict[str, Any]]:
-    request_model = build_actions_request_model(existing_ids)
+    ActionsModel = build_actions_request_model(existing_ids)
     tool_definition: dict[str, Any] = {
         "type": "function",
         "function": {
             "name": "memory_actions",
-            "description": "Generate the complete memory action plan for this request.",
-            "strict": True,
-            "parameters": request_model.model_json_schema(),
+            "description": "Return a memory action plan.",
+            "parameters": ActionsModel.model_json_schema(),
         },
     }
     tool_choice = {"type": "function", "function": {"name": "memory_actions"}}
-    return request_model, tool_definition, tool_choice
+    return ActionsModel, tool_definition, tool_choice
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -727,13 +729,10 @@ class Filter:
         """Generic wrapper around OpenAI chat completions.
 
         Behavior:
-        - If `response_model` is provided, attempts structured outputs first (SDK parse).
-        - If structured outputs are rejected as unsupported (Bad Request), falls back to a
-          normal completion that is explicitly instructed (with a JSON Schema) to return
-          valid JSON matching the schema, then parses the JSON (stripping ```json fences).
-        - If `response_model` is provided, this function returns a validated model instance
-          or raises (it never returns a raw string in that case).
-        - If `response_model` is not provided, returns raw text.
+        - If `response_model` is None, calls chat.completions.create and returns raw text.
+        - If `response_model` is provided, calls chat.completions.create with `tools` and
+          forced `tool_choice`, then validates exactly one tool call named `memory_actions`.
+          Any provider rejection or malformed response raises immediately (no fallback).
         """
 
         user_has_own_key = bool(
@@ -848,104 +847,58 @@ class Filter:
 
         model_cls = cast(Any, response_model)
         self.log(
-            f"attempting structured outputs with {model_cls.__name__}",
+            f"calling tool-calling path with {model_cls.__name__}",
             level="debug",
         )
 
-        if tools:
-            request_args: dict[str, Any] = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": temperature,
-                "tools": cast(Any, tools),
-                **extra_args,
-            }
-            if tool_choice is not None:
-                request_args["tool_choice"] = cast(Any, tool_choice)
-            response = client.chat.completions.create(**request_args)
-            message = response.choices[0].message
-            if not message.tool_calls:
-                raise ValueError("no tool call returned for structured action plan")
-
-            tool_call = message.tool_calls[0]
-            if tool_call.function.name != "memory_actions":
-                raise ValueError(f"unexpected tool name: {tool_call.function.name}")
-
-            return model_cls.model_validate_json(tool_call.function.arguments)
-
-        try:
-            response = client.chat.completions.parse(
-                model=model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                response_format=cast(Any, response_model),
-                **extra_args,  # pyright: ignore[reportArgumentType]
+        if not tools:
+            raise ValueError(
+                "response_model requires tools to be provided for tool-calling path"
             )
 
-            message = response.choices[0].message
+        request_args: dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "tools": cast(Any, tools),
+            **extra_args,
+        }
+        if tool_choice is not None:
+            request_args["tool_choice"] = cast(Any, tool_choice)
 
-            # 1. 优先使用 SDK 自动解析的结果
-            if message.parsed:
-                return cast(BaseModel, message.parsed)
+        response = client.chat.completions.create(**request_args)
+        self.log(f"tool-call sdk response: {response}", level="debug")
+        message = response.choices[0].message
 
-            # 2. 如果自动解析失败（parsed is None），检查是否有拒绝对话（Refusal）
-            if getattr(message, "refusal", None):
-                raise ValueError(
-                    f"Model refused to generate structured output: {message.refusal}"
-                )
-
-            # 3. 如果 parsed 为 None 但存在 content，说明模型可能返回了非标准格式（如带 markdown 围栏）
-            #    此时尝试手动清洗和解析
-            if message.content:
-                self.log(
-                    f"message.parsed is None, falling back to manual cleaning. Raw content: {message.content[:200]}...",
-                    level="warning",
-                )
-                cleaned = _strip_json_fences(message.content)
-                self.log(
-                    f"Cleaned content in try-block: {cleaned[:200]}...", level="debug"
-                )
-
-                # 手动调用 Pydantic 的验证方法
-                # 注意：如果 JSON 依然非法，这里会抛出 ValidationError，建议根据需要决定是否捕获
-                return model_cls.model_validate_json(cleaned)
-
-            # 4. 既没有 parsed 也没有 content
-            raise ValueError(f"Unable to parse structured response. message={message}")
-
-        except BadRequestError as e:
+        if message.tool_calls and message.content:
             self.log(
-                f"structured outputs unsupported by API; falling back to schema-instructed JSON. error={e}",
+                f"response has both tool_calls and content; ignoring content. content={message.content[:200]}",
                 level="warning",
             )
 
-            fallback_messages: list[dict[str, str]] = [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "system",
-                    "content": _schema_instructions_for(model_cls),
-                },
-                {"role": "user", "content": user_message},
-            ]
-
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=fallback_messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                **extra_args,  # pyright: ignore[reportArgumentType]
+        tool_calls = message.tool_calls or []
+        if len(tool_calls) == 0:
+            raise ValueError(
+                f"expected exactly one tool call but got zero. finish_reason={response.choices[0].finish_reason}"
+            )
+        if len(tool_calls) > 1:
+            raise ValueError(
+                f"expected exactly one tool call but got {len(tool_calls)}"
             )
 
-            text_response = response.choices[0].message.content
-            if text_response is None:
-                raise ValueError(f"no text response from LLM. message={text_response}")
-
-            self.log(
-                f"raw text_response before stripping: {text_response[:200]}...",
-                level="debug",
+        tool_call = tool_calls[0]
+        if tool_call.function.name != "memory_actions":
+            raise ValueError(
+                f"unexpected tool name: {tool_call.function.name!r}; expected 'memory_actions'"
             )
-            cleaned = _strip_json_fences(text_response)
-            self.log(f"cleaned after stripping: {cleaned[:200]}...", level="debug")
-            return model_cls.model_validate_json(cleaned)
+
+        raw_args = tool_call.function.arguments
+        if not raw_args or not raw_args.strip():
+            raise ValueError("tool call returned empty arguments")
+
+        self.log(f"tool call arguments: {raw_args[:500]}", level="debug")
+        plan = model_cls.model_validate_json(raw_args)
+        return plan
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1489,20 +1442,33 @@ class Filter:
         )
 
         try:
-            request_model, tool_definition, tool_choice = build_memory_actions_tool(
-                [m.mem_id for m in related_memories]
+            existing_ids = [m.mem_id for m in related_memories]
+            if len(existing_ids) > 50:
+                self.log(
+                    f"truncating memory action ID constraints from {len(existing_ids)} to 50",
+                    level="warning",
+                )
+                existing_ids = existing_ids[:50]
+
+            ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(
+                existing_ids
             )
             action_plan = await self.query_openai_sdk(
                 system_prompt=UNIFIED_SYSTEM_PROMPT,
                 user_message=planning_input,
-                response_model=request_model,
+                response_model=ActionsModel,
                 tools=[tool_definition],
                 tool_choice=tool_choice,
             )
+            action_plan = cast(MemoryActionRequestStub, action_plan)
             self.log(f"action plan: {action_plan}", level="debug")
 
+            if not action_plan.actions:
+                self.log("no changes", level="info")
+                return
+
             await self.apply_memory_actions(
-                action_plan=action_plan,  # pyright: ignore[reportArgumentType]
+                action_plan=action_plan,
                 user=user,
                 emitter=emitter,
             )
