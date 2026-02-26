@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.4.0
+version: 1.4.1
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -60,6 +60,7 @@ from open_webui.utils.access_control import has_permission
 LogLevel = Literal["debug", "info", "warning", "error"]
 
 STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
+INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
 
 
 UNIFIED_SYSTEM_PROMPT = """\
@@ -595,11 +596,26 @@ class Filter:
             default=5,
             description="number of related memories to consider when updating memories",
         )
+        enable_inlet_memory_context: bool = Field(
+            default=True,
+            description="inject high-similarity related memories into the request context during inlet",
+        )
+        inlet_related_memories_n: Optional[int] = Field(
+            default=None,
+            ge=1,
+            description="number of related memories to retrieve for inlet injection. if not set, uses related_memories_n",
+        )
         minimum_memory_similarity: Optional[float] = Field(
             default=None,
             ge=0.0,
             le=1.0,
             description="minimum similarity of memories to consider for updates. higher is more similar to user query. if not set, no filtering is applied.",
+        )
+        inlet_minimum_memory_similarity: Optional[float] = Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="minimum similarity for memories injected in inlet. if not set, falls back to minimum_memory_similarity",
         )
         allow_unsafe_user_overrides: bool = Field(
             default=False,
@@ -989,6 +1005,8 @@ class Filter:
         self,
         messages: list[dict[str, Any]],
         user: UserModel,
+        top_k: Optional[int] = None,
+        minimum_similarity: Optional[float] = None,
     ) -> list[Memory]:
         """
         Query and retrieve related memories based on conversation context.
@@ -1001,14 +1019,18 @@ class Filter:
             List of Memory objects filtered by minimum similarity threshold
         """
         memory_query = self.build_memory_query(messages)
+        effective_top_k = top_k or self.valves.related_memories_n
+        effective_minimum_similarity = (
+            self.valves.minimum_memory_similarity
+            if minimum_similarity is None
+            else minimum_similarity
+        )
 
         # Query related memories
         try:
             results = await query_memory(
                 request=Request(scope={"type": "http", "app": webui_app}),
-                form_data=QueryMemoryForm(
-                    content=memory_query, k=self.valves.related_memories_n
-                ),
+                form_data=QueryMemoryForm(content=memory_query, k=effective_top_k),
                 user=user,
             )
         except HTTPException as e:
@@ -1032,17 +1054,17 @@ class Filter:
         )
 
         # Filter by minimum similarity if configured
-        if self.valves.minimum_memory_similarity is not None:
+        if effective_minimum_similarity is not None:
             filtered_memories = [
                 mem
                 for mem in related_memories
                 if mem.similarity_score is not None
-                and mem.similarity_score >= self.valves.minimum_memory_similarity
+                and mem.similarity_score >= effective_minimum_similarity
             ]
             filtered_count = len(related_memories) - len(filtered_memories)
             if filtered_count > 0:
                 self.log(
-                    f"filtered out {filtered_count} memories below similarity threshold {self.valves.minimum_memory_similarity}",
+                    f"filtered out {filtered_count} memories below similarity threshold {effective_minimum_similarity}",
                     level="info",
                 )
             related_memories = filtered_memories
@@ -1051,6 +1073,75 @@ class Filter:
         self.log(f"related memories: {related_memories}", level="debug")
 
         return related_memories
+
+    def _run_async_blocking(self, coro: Awaitable[Any]) -> Any:
+        result_holder: dict[str, Any] = {}
+        error_holder: dict[str, Exception] = {}
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result_holder["result"] = loop.run_until_complete(coro)
+            except Exception as e:
+                error_holder["error"] = e
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+
+        if "error" in error_holder:
+            raise error_holder["error"]
+
+        return result_holder.get("result")
+
+    def build_inlet_memory_context(self, memories: list[Memory]) -> str:
+        memory_lines = []
+        for idx, memory in enumerate(memories, start=1):
+            score_text = (
+                f" (similarity={memory.similarity_score:.3f})"
+                if memory.similarity_score is not None
+                else ""
+            )
+            memory_lines.append(f"{idx}. {memory.content}{score_text}")
+
+        joined_memories = "\n".join(memory_lines)
+        return (
+            f"{INLET_MEMORY_CONTEXT_PREFIX}\n"
+            "Use these user memories as high-priority personalization context when relevant. "
+            "Do not mention this memory block unless the user asks.\n"
+            f"{joined_memories}"
+        )
+
+    def inject_memory_context_into_messages(
+        self,
+        messages: list[dict[str, Any]],
+        memory_context: str,
+    ) -> list[dict[str, Any]]:
+        cleaned_messages = []
+        for message in messages:
+            is_old_memory_context = (
+                message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and message["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
+            )
+            if not is_old_memory_context:
+                cleaned_messages.append(message)
+
+        insert_at = 0
+        while (
+            insert_at < len(cleaned_messages)
+            and cleaned_messages[insert_at].get("role") == "system"
+        ):
+            insert_at += 1
+
+        cleaned_messages.insert(
+            insert_at,
+            {"role": "system", "content": memory_context},
+        )
+        return cleaned_messages
 
     async def cleanup_expired_memories(
         self,
@@ -1434,6 +1525,65 @@ class Filter:
         self.log(
             f"inlet: user ID: {__user__.get('id') if __user__ else 'no user'}",
             level="debug",
+        )
+
+        if not self.valves.enable_inlet_memory_context:
+            return body
+        if __user__ is None:
+            return body
+
+        user_id = __user__.get("id")
+        if not isinstance(user_id, str) or not user_id:
+            self.log(
+                "inlet context injection skipped: invalid user id", level="warning"
+            )
+            return body
+
+        user = Users.get_user_by_id(user_id)
+        if user is None:
+            self.log("inlet context injection skipped: user not found", level="warning")
+            return body
+
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or len(messages) < 1:
+            return body
+
+        inlet_top_k = (
+            self.valves.inlet_related_memories_n or self.valves.related_memories_n
+        )
+        inlet_threshold = (
+            self.valves.minimum_memory_similarity
+            if self.valves.inlet_minimum_memory_similarity is None
+            else self.valves.inlet_minimum_memory_similarity
+        )
+
+        try:
+            related_memories = cast(
+                list[Memory],
+                self._run_async_blocking(
+                    self.get_related_memories(
+                        messages=messages,
+                        user=user,
+                        top_k=inlet_top_k,
+                        minimum_similarity=inlet_threshold,
+                    )
+                ),
+            )
+        except Exception as e:
+            self.log(f"inlet memory context injection failed: {e}", level="warning")
+            return body
+
+        if not related_memories:
+            return body
+
+        memory_context = self.build_inlet_memory_context(related_memories)
+        body["messages"] = self.inject_memory_context_into_messages(
+            messages=messages,
+            memory_context=memory_context,
+        )
+        self.log(
+            f"inlet injected {len(related_memories)} related memories into context",
+            level="info",
         )
 
         return body

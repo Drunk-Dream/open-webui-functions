@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import json
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,7 +22,12 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 from pydantic import ValidationError
 
-from auto_memory import Filter, Memory, build_memory_actions_tool
+from auto_memory import (
+    Filter,
+    INLET_MEMORY_CONTEXT_PREFIX,
+    Memory,
+    build_memory_actions_tool,
+)
 
 
 @pytest.fixture
@@ -289,6 +295,7 @@ async def test_no_tool_calls_hard_fails_no_mutations(mock_user, mock_emitter):
     # No mutations should have occurred
     assert len(mutation_calls) == 0
 
+
 @pytest.mark.asyncio
 async def test_extra_keys_rejected_strict_schema_no_mutations(
     mock_user, mock_emitter, sample_memories
@@ -335,3 +342,99 @@ async def test_extra_keys_rejected_strict_schema_no_mutations(
 
     # No mutations should have occurred
     assert len(mutation_calls) == 0
+
+
+def test_inlet_injects_related_memories_into_messages(mock_emitter):
+    filter_instance = Filter()
+    memory = Memory(
+        mem_id="mem-101",
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        update_at=datetime(2026, 1, 1, 12, 0, 0),
+        content="User prefers concise answers",
+        similarity_score=0.91,
+    )
+    body = {
+        "messages": [
+            {"role": "system", "content": "Core system prompt"},
+            {"role": "user", "content": "hi"},
+        ]
+    }
+
+    with (
+        patch("auto_memory.Users.get_user_by_id") as mock_get_user,
+        patch.object(
+            filter_instance,
+            "_run_async_blocking",
+            side_effect=lambda coro: (coro.close(), [memory])[1],
+        ),
+    ):
+        mock_get_user.return_value = MagicMock(id="user-1")
+        updated = filter_instance.inlet(
+            body=body,
+            __event_emitter__=mock_emitter,
+            __user__={"id": "user-1"},
+        )
+
+    system_messages = [m for m in updated["messages"] if m.get("role") == "system"]
+    assert len(system_messages) == 2
+    assert system_messages[1]["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
+    assert "User prefers concise answers" in system_messages[1]["content"]
+
+
+def test_inlet_injects_with_single_user_message(mock_emitter):
+    filter_instance = Filter()
+    memory = Memory(
+        mem_id="mem-102",
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        update_at=datetime(2026, 1, 1, 12, 0, 0),
+        content="User likes short replies",
+        similarity_score=0.9,
+    )
+    body = {"messages": [{"role": "user", "content": "test"}]}
+
+    with (
+        patch("auto_memory.Users.get_user_by_id") as mock_get_user,
+        patch.object(
+            filter_instance,
+            "_run_async_blocking",
+            side_effect=lambda coro: (coro.close(), [memory])[1],
+        ),
+    ):
+        mock_get_user.return_value = MagicMock(id="user-1")
+        updated = filter_instance.inlet(
+            body=body,
+            __event_emitter__=mock_emitter,
+            __user__={"id": "user-1"},
+        )
+
+    assert len(updated["messages"]) == 2
+    assert updated["messages"][0]["role"] == "system"
+    assert updated["messages"][0]["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
+    assert updated["messages"][1] == {"role": "user", "content": "test"}
+
+
+def test_inject_memory_context_replaces_previous_memory_block():
+    filter_instance = Filter()
+    messages = [
+        {"role": "system", "content": "Core system prompt"},
+        {
+            "role": "system",
+            "content": f"{INLET_MEMORY_CONTEXT_PREFIX}\nold context",
+        },
+        {"role": "user", "content": "hello"},
+    ]
+
+    injected = filter_instance.inject_memory_context_into_messages(
+        messages=messages,
+        memory_context=f"{INLET_MEMORY_CONTEXT_PREFIX}\nnew context",
+    )
+
+    memory_blocks = [
+        m
+        for m in injected
+        if m.get("role") == "system"
+        and isinstance(m.get("content"), str)
+        and m["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
+    ]
+    assert len(memory_blocks) == 1
+    assert "new context" in memory_blocks[0]["content"]

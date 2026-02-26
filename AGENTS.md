@@ -1,169 +1,172 @@
 # AGENTS.md
 
-Guidance for autonomous coding agents in this repository.
+Guide for coding agents in this repository.
 
-## Project Scope
+## Purpose
 
-- This repo is for Open WebUI plugin/function development.
-- Current active plugin is `auto_memory.py`.
-- `open-webui/` is the upstream Open WebUI project as a submodule, used as reference.
-- `open_webui/` is a minimal local mock package for plugin imports/tests.
-- Default target is root plugin code, not submodule internals.
+- Focus on root plugin development with fast, reliable validation.
+- Keep diffs minimal and aligned with existing code patterns.
+- Prevent false failures by skipping `open-webui/` submodule tests by default.
 
-## Important Directories
+## Scope Boundaries
 
-- Root plugin files:
+- Default editable scope:
+  - `auto_memory.py`
+  - `tests/`
+  - root docs/config files related to plugin work
+  - `open_webui/` mock package when needed for tests
+- Reference-only by default:
+  - `open-webui/` upstream submodule
+- Do not edit submodule files unless explicitly requested.
+
+## Repository Map
+
+- Plugin:
   - `auto_memory.py`
   - `auto_memory.backup.py` (reference)
-  - `pyproject.toml`
-- Mock dependency package:
+- Root tests:
+  - `tests/test_auto_memory_function_calling.py`
+  - `tests/conftest.py`
+- Local mock dependency package:
   - `open_webui/internal/db.py`
-  - `open_webui/main.py`
   - `open_webui/models/users.py`
-- Reference-only submodule:
+  - `open_webui/routers/memories.py`
+  - `open_webui/utils/access_control.py`
+- Upstream submodule:
   - `open-webui/`
 
-## Environment Baseline
+## Rules Files Check
 
-- Python: `>=3.12` (`pyproject.toml`).
-- Dependency manager: `uv` (`uv.lock` present).
-- Root dev dependencies include `pytest`, `pytest-asyncio`, `fastapi`, `pydantic`, `sqlalchemy`, `openai`.
+- `.cursorrules`: not present
+- `.cursor/rules/`: not present
+- `.github/copilot-instructions.md`: not present
+- If these appear later, merge their constraints into this guide.
 
-## Setup Commands
+## Environment
 
-Run from repository root:
+- Python: `>=3.12`
+- Package manager: `uv`
+- Dev deps include `pytest`, `pytest-asyncio`, `fastapi`, `pydantic`, `sqlalchemy`, `openai`.
+
+## Setup
+
+Run from repo root:
 
 ```bash
 uv sync --dev
 ```
 
-Optional checks:
+Quick sanity checks:
 
 ```bash
-.venv/bin/python --version
-.venv/bin/pytest --version
+uv run python --version
+uv run pytest --version
 ```
 
-## Build / Lint / Typecheck / Test Commands
+## Build / Lint / Typecheck
 
-Root-level status today:
-
-- Build: no dedicated root build command configured.
-- Lint: no dedicated root lint command configured.
-- Typecheck: no dedicated root typecheck command configured.
-
-Testing commands:
+- No dedicated root build command is configured.
+- No dedicated root lint command is configured.
+- No dedicated root typecheck command is configured.
+- File-level syntax check:
 
 ```bash
-uv run pytest
-uv run pytest path/to/test_file.py
-uv run pytest path/to/test_file.py::test_function_name
-uv run pytest path/to/test_file.py::TestClassName::test_method_name
+uv run python -m py_compile auto_memory.py tests/test_auto_memory_function_calling.py
 ```
 
-Useful pytest flags:
+## Test Commands (Default)
+
+Always ignore submodule tests in normal plugin work:
 
 ```bash
-uv run pytest -q
-uv run pytest -x
+uv run pytest -q --ignore=open-webui
+uv run pytest -q --ignore=open-webui tests/test_auto_memory_function_calling.py
+uv run pytest -q --ignore=open-webui tests/test_auto_memory_function_calling.py::test_name
+uv run pytest -q --ignore=open-webui tests/test_auto_memory_function_calling.py::TestClassName::test_method_name
+uv run pytest -x --ignore=open-webui
 ```
 
-## Single-Test Guidance
+## Single-Test Workflow
 
-- Prefer node-id targeting for fast feedback.
-- Run one failing test first, then its file, then broader suite if needed.
+- Start with one failing test node-id.
+- Then run its test file.
+- Then run broader root tests.
+- Keep `--ignore=open-webui` in all routine runs.
 
-## Command Selection Policy
+## Why Ignore `open-webui/`
 
-- Prefer root commands for plugin work.
-- Do not assume submodule (`open-webui/`) Makefile/scripts apply to root plugin flow.
-- Only run submodule commands when explicitly asked to work in `open-webui/`.
+- The submodule contains upstream suites with extra dependencies.
+- Running them from this repo can fail for unrelated reasons.
+- Root plugin validation should remain isolated unless submodule work is requested.
 
-## Coding Style - Imports
+## Imports
 
-Observed style in `auto_memory.py`:
-
-- Import grouping:
-  1. standard library
-  2. third-party packages
-  3. local package imports
+- Use import groups in order:
+  1) standard library
+  2) third-party
+  3) local modules
 - Use absolute imports.
-- Use multiline parenthesized imports for long type lists.
-- Keep blank lines between groups.
+- Use multiline parenthesized imports for long lists.
 
-## Coding Style - Formatting
+## Formatting
 
-- Follow existing formatting in touched files.
-- Prefer double-quoted strings, matching current dominant style.
-- Keep code readable and explicit over clever shortcuts.
-- Add comments only when logic is non-obvious.
+- Follow existing style in modified files.
+- Prefer double-quoted strings.
+- Keep code explicit over clever shortcuts.
+- Add comments only for non-obvious logic.
 
-## Coding Style - Typing
+## Typing
 
-- Add/maintain type hints for modified function signatures.
-- Existing code uses `Literal`, `Optional`, `Union`, `TypeVar`, `overload`, and `cast`.
-- Match local file style for typing syntax.
-- Pydantic models should have explicit field types.
-- Use `Field(...)` when validation metadata is meaningful.
+- Preserve type hints for modified signatures.
+- Follow local style (`Optional`, `Literal`, `Union`, `TypeVar`, `cast`, `overload`).
+- Keep Pydantic fields explicitly typed.
+- Do not introduce unsafe type-suppression shortcuts.
 
-## Naming Conventions
+## Naming
 
-- Functions/methods/variables: `snake_case`.
-- Classes: `PascalCase`.
-- Constants/type aliases: `UPPER_SNAKE_CASE`.
-- Private helpers may use leading underscore.
+- Functions/methods/variables: `snake_case`
+- Classes: `PascalCase`
+- Constants/type aliases: `UPPER_SNAKE_CASE`
+- Private helpers: leading underscore when needed
 
-## Error Handling Conventions
+## Error Handling
 
-- Validate required inputs early and fail clearly.
+- Validate inputs early and fail clearly.
 - Catch specific exceptions before generic ones.
-- Log with context before rethrowing where appropriate.
-- Use explicit fallback paths only when behavior is intentional.
+- Log useful context on failure.
+- Re-raise with clear intent when needed.
 - Avoid silent exception swallowing.
 
-## Logging Conventions
+## Logging
 
-- Use logging, not print.
-- Existing plugin centralizes logs via `Filter.log(...)` and `debug_mode` gating.
-- Use levels intentionally:
-  - `debug` internal details
-  - `info` lifecycle milestones
-  - `warning` recoverable anomalies
-  - `error` failures
+- Use logging, not `print`.
+- In plugin code, prefer `Filter.log(...)` conventions.
+- Level usage:
+  - `debug`: internal details
+  - `info`: milestones
+  - `warning`: recoverable anomalies
+  - `error`: failures
 
-## Async / Concurrency Conventions
+## Async and Concurrency
 
-- Keep async flows `async`/`await` end-to-end.
-- Bridge blocking work using safe adapters (for example `asyncio.to_thread`).
-- Reuse existing detached async thread runner pattern only when needed.
-- Do not introduce new concurrency models without strong reason.
+- Keep async flow consistent with `async`/`await`.
+- Bridge blocking tasks with existing thread patterns when necessary.
+- Avoid introducing new concurrency models without a strong reason.
 
-## Data / DB Conventions
+## Data and DB
 
-- Reuse existing SQLAlchemy context-manager patterns (`get_db_context`, `get_db`).
-- Keep DB operations scoped and short-lived.
+- Reuse existing DB context-manager patterns.
+- Keep DB operations short-lived and scoped.
+- Avoid broad stateful side effects.
 
-## Modification Boundaries
-
-- Default editable scope:
-  - root plugin files
-  - root docs/config relevant to plugin development
-  - `open_webui/` mock package when task requires
-- Avoid editing `open-webui/` submodule unless explicitly requested.
-
-## Testing Expectations for Changes
-
-- If tests exist for touched area: run single test, then file, then broader suite as needed.
-- If no tests exist, state that explicitly in final report.
-
-## Agent Workflow Expectations
+## Agent Execution Discipline
 
 - Read relevant files before editing.
-- Match existing patterns before introducing new ones.
-- Keep diffs minimal and focused.
+- Match local patterns before adding abstractions.
+- Keep changes focused and non-disruptive.
 - Do not commit unless explicitly requested.
-- Do not modify unrelated files.
+- Report exactly what was verified and with which commands.
 
-## Notes
+## Escalation Rule
 
-- Root tooling is intentionally lightweight for plugin-focused development.
+- Only run or edit `open-webui/` when the user explicitly asks for submodule-level work.
