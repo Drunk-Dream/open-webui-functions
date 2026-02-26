@@ -5,12 +5,13 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.4.1
+version: 1.4.2
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
 Compatibility Note:
+- Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
 - Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
 - Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
 - Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
@@ -1481,6 +1482,47 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
+        def _extract_memory_id(add_result: Any) -> Optional[str]:
+            if isinstance(add_result, dict):
+                mem_id = add_result.get("id")
+                if isinstance(mem_id, str) and mem_id.strip():
+                    return mem_id
+                nested = add_result.get("memory")
+                if isinstance(nested, dict):
+                    nested_id = nested.get("id")
+                    if isinstance(nested_id, str) and nested_id.strip():
+                        return nested_id
+            if hasattr(add_result, "id"):
+                attr_id = getattr(add_result, "id")
+                if isinstance(attr_id, str) and attr_id.strip():
+                    return attr_id
+            return None
+
+        def _initialize_memory_expiry(mem_id: str) -> None:
+            import time
+
+            now_timestamp = int(time.time())
+            expired_at = now_timestamp + (self.valves.initial_expiry_days * 86400)
+            existing = MemoryExpiries.get_by_mem_id(mem_id)
+
+            if existing:
+                MemoryExpiries.update_expired_at(mem_id, expired_at)
+                self.log(
+                    f"reset expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+                    level="debug",
+                )
+                return
+
+            MemoryExpiries.insert(
+                mem_id=mem_id,
+                user_id=user.id,
+                expired_at=expired_at,
+            )
+            self.log(
+                f"initialized expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+                level="debug",
+            )
+
         async def _delete_with_db(action: MemoryDeleteAction) -> None:
             with get_db() as db:
                 await delete_memory_by_id(
@@ -1488,6 +1530,28 @@ class Filter:
                     request=Request(scope={"type": "http", "app": webui_app}),
                     user=user,
                     db=db,
+                )
+
+        async def _add_with_expiry(action: MemoryAddAction) -> None:
+            add_result = await add_memory(
+                request=Request(scope={"type": "http", "app": webui_app}),
+                form_data=AddMemoryForm(content=action.content),
+                user=user,
+            )
+            mem_id = _extract_memory_id(add_result)
+            if not mem_id:
+                self.log(
+                    "memory add returned no id; skipped expiry initialization",
+                    level="warning",
+                )
+                return
+
+            try:
+                _initialize_memory_expiry(mem_id)
+            except Exception as expiry_error:
+                self.log(
+                    f"failed to initialize expiry for memory {mem_id}: {expiry_error}",
+                    level="warning",
                 )
 
         # Group actions and define handlers
@@ -1515,11 +1579,7 @@ class Filter:
             },
             "add": {
                 "actions": [a for a in actions if a.action == "add"],
-                "handler": lambda a: add_memory(
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=AddMemoryForm(content=a.content),
-                    user=user,
-                ),
+                "handler": _add_with_expiry,
                 "log_msg": lambda a: f"added memory. content={a.content}",
                 "error_msg": lambda a, e: f"failed to add memory: {e}",
                 "skip_empty": lambda a: not a.content.strip(),

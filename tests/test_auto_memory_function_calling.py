@@ -327,6 +327,72 @@ async def test_extra_keys_rejected_strict_schema_no_mutations(
     assert len(mutation_calls) == 0
 
 
+@pytest.mark.asyncio
+async def test_add_action_initializes_expiry_immediately(mock_user, mock_emitter):
+    filter_instance = Filter()
+    filter_instance.valves.debug_mode = False
+    filter_instance.user_valves = filter_instance.UserValves()
+    filter_instance.user_valves.show_status = False
+
+    action_plan = MemoryActionRequestStub(
+        actions=[MemoryAddAction(action="add", content="User likes espresso")]
+    )
+
+    async def mock_add(request, form_data, user):
+        return {"id": "mem-new-001", "content": form_data.content}
+
+    with (
+        patch("auto_memory.add_memory", new=mock_add),
+        patch("auto_memory.MemoryExpiries.get_by_mem_id", return_value=None),
+        patch("auto_memory.MemoryExpiries.insert") as mock_insert,
+        patch("auto_memory.MemoryExpiries.update_expired_at") as mock_update,
+        patch("time.time", return_value=1000),
+    ):
+        await filter_instance.apply_memory_actions(
+            action_plan=action_plan,
+            user=mock_user,
+            emitter=mock_emitter,
+        )
+
+    mock_update.assert_not_called()
+    mock_insert.assert_called_once_with(
+        mem_id="mem-new-001",
+        user_id=mock_user.id,
+        expired_at=1000 + filter_instance.valves.initial_expiry_days * 86400,
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_action_without_memory_id_skips_expiry_init(mock_user, mock_emitter):
+    filter_instance = Filter()
+    filter_instance.valves.debug_mode = False
+    filter_instance.user_valves = filter_instance.UserValves()
+    filter_instance.user_valves.show_status = False
+
+    action_plan = MemoryActionRequestStub(
+        actions=[MemoryAddAction(action="add", content="User likes tea")]
+    )
+
+    async def mock_add(request, form_data, user):
+        return {"content": form_data.content}
+
+    with (
+        patch("auto_memory.add_memory", new=mock_add),
+        patch("auto_memory.MemoryExpiries.get_by_mem_id") as mock_get,
+        patch("auto_memory.MemoryExpiries.insert") as mock_insert,
+        patch("auto_memory.MemoryExpiries.update_expired_at") as mock_update,
+    ):
+        await filter_instance.apply_memory_actions(
+            action_plan=action_plan,
+            user=mock_user,
+            emitter=mock_emitter,
+        )
+
+    mock_get.assert_not_called()
+    mock_insert.assert_not_called()
+    mock_update.assert_not_called()
+
+
 def test_inlet_injects_related_memories_into_messages(mock_emitter):
     filter_instance = Filter()
     memory = Memory(
