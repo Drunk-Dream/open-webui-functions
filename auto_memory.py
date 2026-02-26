@@ -66,11 +66,13 @@ INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
 UNIFIED_SYSTEM_PROMPT = """\
 You maintain a collection of Memories: individual facts or journal entries about a user, each automatically timestamped on creation or update.
 
-Your only job here is to decide what memory actions to take. You must call the `memory_actions` tool exactly once. Do not write any normal text response.
+Your only job here is to decide what memory actions to take. You must respond with tool calls only. Do not write any normal text response.
 
 <output_rules>
-- Call `memory_actions` exactly once.
-- Set `actions` to an empty list when no changes are needed.
+- Use only these tools: `add_memory`, `update_memory`, `delete_memory`.
+- Each tool call must handle exactly one memory.
+- You may call tools multiple times when multiple memory changes are needed.
+- If no changes are needed, return no tool calls.
 - Never output plain text. The tool call is your entire response.
 - Never store credentials, passwords, API keys, tokens, or any secrets.
 </output_rules>
@@ -117,7 +119,7 @@ Your only job here is to decide what memory actions to take. You must call the `
 </what_not_to_extract>
 
 <actions_to_take>
-Based on your analysis, call `memory_actions` with a list of actions:
+Based on your analysis, call one or more tools (`add_memory`, `update_memory`, `delete_memory`):
 
 **ADD**: Create new memory when:
 - New information not covered by existing memories
@@ -197,7 +199,9 @@ assistant: That's impressive! Rust is a great choice.
 RELATED_MEMORIES_JSON:
 [{"mem_id": "1", "created_at": "2024-01-05T10:00:00", "update_at": "2024-01-05T10:00:00", "content": "User enjoys electric vehicles"}]
 
-Tool call: memory_actions({"actions": [{"action": "add", "content": "User works as a senior data scientist at Tesla"}, {"action": "add", "content": "User's favorite programming language is Rust"}]})
+Tool calls:
+1) add_memory({"content": "User works as a senior data scientist at Tesla"})
+2) add_memory({"content": "User's favorite programming language is Rust"})
 
 **Example 2 - No change needed (sarcasm/joke)**
 Input:
@@ -212,7 +216,7 @@ assistant: 😂 Sure you can!
 RELATED_MEMORIES_JSON:
 []
 
-Tool call: memory_actions({"actions": []})
+Tool call: (none)
 </examples>\
 """
 
@@ -260,6 +264,19 @@ class MemoryDeleteAction(StrictBaseModel):
     id: str = Field(..., description="ID of the memory to delete")
 
 
+class MemoryAddToolRequest(StrictBaseModel):
+    content: str = Field(..., description="Content of the memory to add")
+
+
+class MemoryUpdateToolRequest(StrictBaseModel):
+    id: str = Field(..., description="ID of the memory to update")
+    new_content: str = Field(..., description="New content for the memory")
+
+
+class MemoryDeleteToolRequest(StrictBaseModel):
+    id: str = Field(..., description="ID of the memory to delete")
+
+
 class MemoryActionRequestStub(StrictBaseModel):
     """This is a stub model to correctly type parameters. Not used directly."""
 
@@ -285,79 +302,50 @@ class Memory(BaseModel):
     )
 
 
-def build_actions_request_model(existing_ids: list[str]):
-    """Dynamically build versions of the Update/Delete action models whose `id` fields
-    are Literal[...] constrained to the provided existing_ids. Returns a tuple:
+def build_memory_action_tools(
+    existing_ids: list[str],
+) -> tuple[dict[str, Type[BaseModel]], list[dict[str, Any]], str]:
+    """Build single-memory tool schemas for add/update/delete actions."""
 
-        (DynamicMemoryUpdateAction, DynamicMemoryDeleteAction, DynamicMemoryUpdateRequest)
+    tool_models: dict[str, Type[BaseModel]] = {
+        "add_memory": MemoryAddToolRequest,
+    }
 
-    If existing_ids is empty, we still return permissive forms (falls back to str) so that
-    add-only flows still parse.
-    """
-    if not existing_ids:
-        # No IDs to constrain, so no relevant memories = can only create new memories
-        return create_model(
-            "MemoriesActionRequest",
-            actions=(
-                list[MemoryAddAction],
-                Field(
-                    default_factory=list,
-                    description="List of actions to perform on memories",
-                    max_length=20,
-                ),
-            ),
-            __base__=StrictBaseModel,
-        )
-    else:
+    if existing_ids:
         id_literal_type = Literal[tuple(existing_ids)]  # type: ignore[misc,valid-type]
-
-        DynamicMemoryUpdateAction = create_model(
-            "MemoryUpdateAction",
-            action=(Literal["update"], ...),
+        dynamic_update_model = create_model(
+            "DynamicMemoryUpdateToolRequest",
             id=(id_literal_type, ...),  # type: ignore[valid-type]
             new_content=(str, ...),
             __base__=StrictBaseModel,
         )
-
-        DynamicMemoryDeleteAction = create_model(
-            "MemoryDeleteAction",
-            action=(Literal["delete"], ...),
+        dynamic_delete_model = create_model(
+            "DynamicMemoryDeleteToolRequest",
             id=(id_literal_type, ...),  # type: ignore[valid-type]
             __base__=StrictBaseModel,
         )
+        tool_models["update_memory"] = cast(Type[BaseModel], dynamic_update_model)
+        tool_models["delete_memory"] = cast(Type[BaseModel], dynamic_delete_model)
 
-        AllowedActions = Union[  # type: ignore[valid-type]
-            MemoryAddAction, DynamicMemoryUpdateAction, DynamicMemoryDeleteAction  # type: ignore[valid-type]
-        ]
-
-        return create_model(
-            "MemoriesActionRequest",
-            actions=(
-                list[AllowedActions],  # type: ignore[valid-type]
-                Field(
-                    default_factory=list,
-                    description="List of actions to perform on memories",
-                    max_length=20,
-                ),
-            ),
-            __base__=StrictBaseModel,
+    tool_definitions: list[dict[str, Any]] = []
+    for tool_name, model in tool_models.items():
+        description = {
+            "add_memory": "Add exactly one memory.",
+            "update_memory": "Update exactly one existing memory by ID.",
+            "delete_memory": "Delete exactly one existing memory by ID.",
+        }[tool_name]
+        tool_definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": description,
+                    "parameters": model.model_json_schema(),
+                },
+            }
         )
 
-
-def build_memory_actions_tool(
-    existing_ids: list[str],
-) -> tuple[Type[BaseModel], dict[str, Any], dict[str, Any]]:
-    ActionsModel = build_actions_request_model(existing_ids)
-    tool_definition: dict[str, Any] = {
-        "type": "function",
-        "function": {
-            "name": "memory_actions",
-            "description": "Return a memory action plan.",
-            "parameters": ActionsModel.model_json_schema(),
-        },
-    }
-    tool_choice = {"type": "function", "function": {"name": "memory_actions"}}
-    return ActionsModel, tool_definition, tool_choice
+    return tool_models, tool_definitions, "required"
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -717,8 +705,18 @@ class Filter:
         user_message: str,
         response_model: Type[R],
         tools: Optional[list[dict[str, Any]]] = None,
-        tool_choice: Optional[dict[str, Any]] = None,
+        tool_choice: Optional[Union[dict[str, Any], str]] = None,
     ) -> R: ...
+
+    @overload
+    async def query_openai_sdk(
+        self,
+        system_prompt: str,
+        user_message: str,
+        response_model: dict[str, Type[BaseModel]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[Union[dict[str, Any], str]] = None,
+    ) -> MemoryActionRequestStub: ...
 
     @overload
     async def query_openai_sdk(
@@ -727,23 +725,25 @@ class Filter:
         user_message: str,
         response_model: None = None,
         tools: Optional[list[dict[str, Any]]] = None,
-        tool_choice: Optional[dict[str, Any]] = None,
+        tool_choice: Optional[Union[dict[str, Any], str]] = None,
     ) -> str: ...
 
     async def query_openai_sdk(
         self,
         system_prompt: str,
         user_message: str,
-        response_model: Optional[type[BaseModel]] = None,
+        response_model: Optional[
+            Union[type[BaseModel], dict[str, Type[BaseModel]]]
+        ] = None,
         tools: Optional[list[dict[str, Any]]] = None,
-        tool_choice: Optional[dict[str, Any]] = None,
-    ) -> Union[str, BaseModel]:
+        tool_choice: Optional[Union[dict[str, Any], str]] = None,
+    ) -> Union[str, BaseModel, MemoryActionRequestStub]:
         """Generic wrapper around OpenAI chat completions.
 
         Behavior:
         - If `response_model` is None, calls chat.completions.create and returns raw text.
         - If `response_model` is provided, calls chat.completions.create with `tools` and
-          forced `tool_choice`, then validates exactly one tool call named `memory_actions`.
+          optional `tool_choice`, then validates tool call arguments using strict schemas.
           Any provider rejection or malformed response raises immediately (no fallback).
         """
 
@@ -802,9 +802,12 @@ class Filter:
 
             return text_response
 
-        model_cls = cast(Any, response_model)
+        if isinstance(response_model, dict):
+            model_label = f"tool-map[{', '.join(sorted(response_model.keys()))}]"
+        else:
+            model_label = cast(Any, response_model).__name__
         self.log(
-            f"calling tool-calling path with {model_cls.__name__}",
+            f"calling tool-calling path with {model_label}",
             level="debug",
         )
 
@@ -838,17 +841,58 @@ class Filter:
             raise ValueError(
                 f"expected exactly one tool call but got zero. finish_reason={response.choices[0].finish_reason}"
             )
+
+        if isinstance(response_model, dict):
+            actions: list[
+                Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]
+            ] = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                if tool_name not in response_model:
+                    expected = ", ".join(sorted(response_model.keys()))
+                    raise ValueError(
+                        f"unexpected tool name: {tool_name!r}; expected one of [{expected}]"
+                    )
+
+                raw_args = tool_call.function.arguments
+                if not raw_args or not raw_args.strip():
+                    raise ValueError(
+                        f"tool call {tool_name!r} returned empty arguments"
+                    )
+
+                self.log(
+                    f"tool call {tool_name} arguments: {raw_args[:500]}", level="debug"
+                )
+                parsed_args = response_model[tool_name].model_validate_json(raw_args)
+                if tool_name == "add_memory":
+                    parsed_add = cast(MemoryAddToolRequest, parsed_args)
+                    actions.append(
+                        MemoryAddAction(action="add", content=parsed_add.content)
+                    )
+                elif tool_name == "update_memory":
+                    parsed_update = cast(MemoryUpdateToolRequest, parsed_args)
+                    actions.append(
+                        MemoryUpdateAction(
+                            action="update",
+                            id=parsed_update.id,
+                            new_content=parsed_update.new_content,
+                        )
+                    )
+                elif tool_name == "delete_memory":
+                    parsed_delete = cast(MemoryDeleteToolRequest, parsed_args)
+                    actions.append(
+                        MemoryDeleteAction(action="delete", id=parsed_delete.id)
+                    )
+
+            return MemoryActionRequestStub(actions=actions)
+
+        model_cls = cast(Any, response_model)
         if len(tool_calls) > 1:
             raise ValueError(
                 f"expected exactly one tool call but got {len(tool_calls)}"
             )
 
         tool_call = tool_calls[0]
-        if tool_call.function.name != "memory_actions":
-            raise ValueError(
-                f"unexpected tool name: {tool_call.function.name!r}; expected 'memory_actions'"
-            )
-
         raw_args = tool_call.function.arguments
         if not raw_args or not raw_args.strip():
             raise ValueError("tool call returned empty arguments")
@@ -1380,14 +1424,14 @@ class Filter:
                 )
                 existing_ids = existing_ids[:50]
 
-            ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(
+            tool_models, tool_definitions, tool_choice = build_memory_action_tools(
                 existing_ids
             )
             action_plan = await self.query_openai_sdk(
                 system_prompt=UNIFIED_SYSTEM_PROMPT,
                 user_message=planning_input,
-                response_model=ActionsModel,
-                tools=[tool_definition],
+                response_model=tool_models,
+                tools=tool_definitions,
                 tool_choice=tool_choice,
             )
             action_plan = cast(MemoryActionRequestStub, action_plan)

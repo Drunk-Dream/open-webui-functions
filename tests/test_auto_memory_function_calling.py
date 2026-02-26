@@ -25,8 +25,12 @@ from pydantic import ValidationError
 from auto_memory import (
     Filter,
     INLET_MEMORY_CONTEXT_PREFIX,
+    MemoryActionRequestStub,
+    MemoryAddAction,
+    MemoryDeleteAction,
     Memory,
-    build_memory_actions_tool,
+    MemoryUpdateAction,
+    build_memory_action_tools,
 )
 
 
@@ -68,10 +72,22 @@ def sample_memories():
     ]
 
 
-def make_tool_call_response(
-    tool_name: str, arguments_dict: dict[str, Any]
+def make_tool_calls_response(
+    tool_calls: list[tuple[str, dict[str, Any]]],
 ) -> ChatCompletion:
-    """Helper to construct a ChatCompletion with tool_calls."""
+    """Helper to construct a ChatCompletion with one or more tool_calls."""
+    message_tool_calls = [
+        ChatCompletionMessageToolCall(
+            id=f"call_{index}",
+            type="function",
+            function=Function(
+                name=tool_name,
+                arguments=json.dumps(arguments_dict),
+            ),
+        )
+        for index, (tool_name, arguments_dict) in enumerate(tool_calls, start=1)
+    ]
+
     return ChatCompletion(
         id="chatcmpl-test",
         object="chat.completion",
@@ -83,16 +99,7 @@ def make_tool_call_response(
                 message=ChatCompletionMessage(
                     role="assistant",
                     content=None,
-                    tool_calls=[
-                        ChatCompletionMessageToolCall(
-                            id="call_abc123",
-                            type="function",
-                            function=Function(
-                                name=tool_name,
-                                arguments=json.dumps(arguments_dict),
-                            ),
-                        )
-                    ],
+                    tool_calls=message_tool_calls,
                 ),
                 finish_reason="tool_calls",
             )
@@ -133,24 +140,21 @@ async def test_valid_mixed_actions_deterministic_order(
     filter_instance.user_valves = filter_instance.UserValves()
     filter_instance.user_valves.show_status = False
 
-    # Build tool with existing IDs
+    # Build tools with existing IDs
     existing_ids = [m.mem_id for m in sample_memories]
-    ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(existing_ids)
+    _, tool_definitions, tool_choice = build_memory_action_tools(existing_ids)
 
-    # Mock OpenAI response with mixed actions
-    mock_response = make_tool_call_response(
-        "memory_actions",
-        {
-            "actions": [
-                {"action": "add", "content": "User prefers dark mode"},
-                {"action": "delete", "id": "mem-001"},
-                {
-                    "action": "update",
-                    "id": "mem-002",
-                    "new_content": "User works at NewCo",
-                },
-            ]
-        },
+    # Mock parsed action plan
+    action_plan = MemoryActionRequestStub(
+        actions=[
+            MemoryAddAction(action="add", content="User prefers dark mode"),
+            MemoryDeleteAction(action="delete", id="mem-001"),
+            MemoryUpdateAction(
+                action="update",
+                id="mem-002",
+                new_content="User works at NewCo",
+            ),
+        ]
     )
 
     # Track mutation call order
@@ -169,9 +173,7 @@ async def test_valid_mixed_actions_deterministic_order(
         patch.object(
             filter_instance,
             "query_openai_sdk",
-            return_value=ActionsModel.model_validate_json(
-                mock_response.choices[0].message.tool_calls[0].function.arguments
-            ),
+            return_value=action_plan,
         ),
         patch("auto_memory.delete_memory_by_id", new=mock_delete),
         patch("auto_memory.update_memory_by_id", new=mock_update),
@@ -184,8 +186,8 @@ async def test_valid_mixed_actions_deterministic_order(
         action_plan = await filter_instance.query_openai_sdk(
             system_prompt="test",
             user_message="test",
-            response_model=ActionsModel,
-            tools=[tool_definition],
+            response_model={"add_memory": Memory},
+            tools=tool_definitions,
             tool_choice=tool_choice,
         )
 
@@ -213,17 +215,7 @@ async def test_invalid_id_rejected_no_mutations(
     filter_instance.user_valves = filter_instance.UserValves()
 
     existing_ids = [m.mem_id for m in sample_memories]
-    ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(existing_ids)
-
-    # Mock response with invalid ID
-    mock_response = make_tool_call_response(
-        "memory_actions",
-        {
-            "actions": [
-                {"action": "delete", "id": "mem-999"},  # Invalid ID
-            ]
-        },
-    )
+    tool_models, _, _ = build_memory_action_tools(existing_ids)
 
     mutation_calls = []
 
@@ -237,9 +229,9 @@ async def test_invalid_id_rejected_no_mutations(
         mock_get_db.return_value.__enter__.return_value = MagicMock()
 
         # Attempt to parse with strict schema
-        raw_args = mock_response.choices[0].message.tool_calls[0].function.arguments
+        raw_args = json.dumps({"id": "mem-999"})
         with pytest.raises(ValidationError) as exc_info:
-            ActionsModel.model_validate_json(raw_args)
+            tool_models["delete_memory"].model_validate_json(raw_args)
 
         # Verify validation error mentions invalid ID
         assert "mem-999" in str(exc_info.value) or "Input should be" in str(
@@ -260,7 +252,7 @@ async def test_no_tool_calls_hard_fails_no_mutations(mock_user, mock_emitter):
     filter_instance.user_valves = filter_instance.UserValves()
 
     existing_ids = ["mem-001"]
-    ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(existing_ids)
+    tool_models, tool_definitions, tool_choice = build_memory_action_tools(existing_ids)
 
     # Mock response without tool_calls
     mock_response = make_no_tool_call_response()
@@ -284,8 +276,8 @@ async def test_no_tool_calls_hard_fails_no_mutations(mock_user, mock_emitter):
             await filter_instance.query_openai_sdk(
                 system_prompt="test",
                 user_message="test",
-                response_model=ActionsModel,
-                tools=[tool_definition],
+                response_model=tool_models,
+                tools=tool_definitions,
                 tool_choice=tool_choice,
             )
 
@@ -308,21 +300,7 @@ async def test_extra_keys_rejected_strict_schema_no_mutations(
     filter_instance.user_valves = filter_instance.UserValves()
 
     existing_ids = [m.mem_id for m in sample_memories]
-    ActionsModel, tool_definition, tool_choice = build_memory_actions_tool(existing_ids)
-
-    # Mock response with extra keys
-    mock_response = make_tool_call_response(
-        "memory_actions",
-        {
-            "actions": [
-                {
-                    "action": "add",
-                    "content": "User likes coffee",
-                    "extra_field": "should_fail",  # Extra key
-                }
-            ]
-        },
-    )
+    tool_models, _, _ = build_memory_action_tools(existing_ids)
 
     mutation_calls = []
 
@@ -331,9 +309,14 @@ async def test_extra_keys_rejected_strict_schema_no_mutations(
 
     with patch("auto_memory.add_memory", new=mock_add):
         # Attempt to parse with strict schema
-        raw_args = mock_response.choices[0].message.tool_calls[0].function.arguments
+        raw_args = json.dumps(
+            {
+                "content": "User likes coffee",
+                "extra_field": "should_fail",
+            }
+        )
         with pytest.raises(ValidationError) as exc_info:
-            ActionsModel.model_validate_json(raw_args)
+            tool_models["add_memory"].model_validate_json(raw_args)
 
         # Verify validation error mentions extra field
         assert "extra_field" in str(
