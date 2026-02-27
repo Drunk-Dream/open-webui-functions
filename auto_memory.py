@@ -5,19 +5,23 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.4.2
+version: 1.4.3
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
-
 Compatibility Note:
+- Version 1.4.3: Code quality improvements - refactored for better readability and maintainability
+  * Extracted nested functions to class private methods for better testability
+  * Replaced magic numbers with named constants (SECONDS_PER_DAY, etc.)
+  * Added comprehensive documentation and type annotations
+  * Unified async execution utilities
+  * Added structural comments for improved code navigation
 - Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
 - Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
 - Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
 - Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
 - Version 1.3.5: Compatible with Open WebUI 0.8.1+
   Memory API signatures updated (db parameter removed from query/add/update operations)
-
 File Structure:
     1. Module Header & Imports (L1-75)
     2. System Prompts - Business Rules (L76-230)
