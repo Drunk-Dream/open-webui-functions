@@ -17,8 +17,18 @@ Compatibility Note:
 - Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
 - Version 1.3.5: Compatible with Open WebUI 0.8.1+
   Memory API signatures updated (db parameter removed from query/add/update operations)
+
+File Structure:
+    1. Module Header & Imports (L1-75)
+    2. System Prompts - Business Rules (L76-230)
+    3. Data Model Layer - Pydantic Models & Utilities (L231-405)
+    4. Infrastructure Layer - Async Tools & Database (L406-580)
+    5. Core Business Layer - Filter Class (L581-end)
 """
 
+# ============================================================================
+# 1. MODULE HEADER & IMPORTS
+# ============================================================================
 import asyncio
 import json
 import logging
@@ -58,6 +68,9 @@ from open_webui.routers.memories import (
 )
 from open_webui.utils.access_control import has_permission
 
+# ============================================================================
+# 2. TYPE DEFINITIONS & CONSTANTS
+# ============================================================================
 LogLevel = Literal["debug", "info", "warning", "error"]
 
 # Type aliases for better readability
@@ -72,6 +85,9 @@ SIMILARITY_SCORE_PRECISION = 3
 STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
 INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
 
+# ============================================================================
+# 3. SYSTEM PROMPTS (Business Rules)
+# ============================================================================
 
 UNIFIED_SYSTEM_PROMPT = """\
 You maintain a collection of Memories: individual facts or journal entries about a user, each automatically timestamped on creation or update.
@@ -231,6 +247,10 @@ Tool call: (none)
 """
 
 
+# ============================================================================
+# 4. DATA MODEL LAYER
+# ============================================================================
+# --- Utility Functions ---
 async def emit_status(
     description: str,
     emitter: EmitterType,
@@ -254,6 +274,7 @@ async def emit_status(
     )
 
 
+# --- Pydantic Models ---
 class StrictBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -312,6 +333,7 @@ class Memory(BaseModel):
     )
 
 
+# --- Model Utilities ---
 def build_memory_action_tools(
     existing_ids: list[str],
 ) -> tuple[dict[str, Type[BaseModel]], list[dict[str, Any]], str]:
@@ -402,6 +424,10 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
     return memories
 
 
+# ============================================================================
+# 5. INFRASTRUCTURE LAYER
+# ============================================================================
+# --- Async Utilities ---
 T = TypeVar("T")
 
 
@@ -465,10 +491,7 @@ def _run_detached(coro: Awaitable[Any]) -> None:
     thread.start()
 
 
-####################
-# MemoryExpiry DB Schema
-####################
-
+# --- Database Models ---
 
 class MemoryExpiry(Base):
     """SQLAlchemy model for tracking memory expiration times."""
@@ -577,6 +600,7 @@ class MemoryExpiryTable:
 MemoryExpiries = MemoryExpiryTable()
 
 
+# --- Database Initialization ---
 def _ensure_table_exists():
     """Ensure MemoryExpiry table exists in database."""
     try:
@@ -592,6 +616,7 @@ def _ensure_table_exists():
 _ensure_table_exists()
 
 
+# --- Vector Database ---
 class MemoryRepository:
     """Centralized vector database operations for memory management."""
 
@@ -619,7 +644,22 @@ R = TypeVar("R", bound=BaseModel)
 ValveType = TypeVar("ValveType", str, int)
 
 
+# ============================================================================
+# 6. CORE BUSINESS LAYER
+# ============================================================================
 class Filter:
+    """Main plugin class for Auto Memory functionality.
+    
+    Architecture:
+        - Configuration: Valves, UserValves
+        - LLM Integration: query_openai_sdk
+        - Memory Management: CRUD operations
+        - Lifecycle Hooks: inlet, outlet
+    """
+    
+    # ------------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------------
     class Valves(BaseModel):
         openai_api_url: str = Field(
             default="https://api.openai.com/v1",
@@ -711,6 +751,9 @@ class Filter:
             description="override for number of recent messages to consider (falls back to global if null). includes assistant responses.",
         )
 
+    # ------------------------------------------------------------------------
+    # Initialization & Utilities
+    # ------------------------------------------------------------------------
     def log(self, message: str, level: LogLevel = "info"):
         if level == "debug" and not self.valves.debug_mode:
             return
@@ -720,6 +763,9 @@ class Filter:
         logger = logging.getLogger()
         getattr(logger, level, logger.info)(message)
 
+    # ------------------------------------------------------------------------
+    # LLM Integration
+    # ------------------------------------------------------------------------
     def messages_to_string(self, messages: list[dict[str, Any]]) -> str:
         stringified_messages: list[str] = []
 
@@ -985,6 +1031,9 @@ class Filter:
             finally:
                 loop.close()
 
+    # ------------------------------------------------------------------------
+    # Memory CRUD Operations (Private)
+    # ------------------------------------------------------------------------
     def _extract_memory_id(self, add_result: Any) -> str | None:
         """Extract memory ID from add_memory API result.
         
@@ -1138,6 +1187,9 @@ class Filter:
             )
         return admin_fallback
 
+    # ------------------------------------------------------------------------
+    # Memory Query & Retrieval
+    # ------------------------------------------------------------------------
     def build_memory_query(self, messages: list[dict[str, Any]]) -> str:
         """Build context-aware query for memory retrieval.
         
@@ -1292,6 +1344,9 @@ class Filter:
 
         return related_memories
 
+    # ------------------------------------------------------------------------
+    # Helper Methods
+    # ------------------------------------------------------------------------
     def _run_async_blocking(self, coro: Awaitable[Any]) -> Any:
         """Run async coroutine synchronously (blocks until complete).
         
@@ -1346,6 +1401,9 @@ class Filter:
         )
         return cleaned_messages
 
+    # ------------------------------------------------------------------------
+    # Memory Lifecycle Management
+    # ------------------------------------------------------------------------
     async def cleanup_expired_memories(
         self,
         user: UserModel,
@@ -1519,6 +1577,9 @@ class Filter:
 
         return stats
 
+    # ------------------------------------------------------------------------
+    # Main Business Flow
+    # ------------------------------------------------------------------------
     async def auto_memory(
         self,
         messages: list[dict[str, Any]],
@@ -1706,6 +1767,9 @@ class Filter:
         if status_message and self.user_valves.show_status:
             await emit_status(status_message, emitter=emitter, status="complete")
 
+    # ------------------------------------------------------------------------
+    # Plugin Lifecycle Hooks
+    # ------------------------------------------------------------------------
     def inlet(
         self,
         body: dict,
