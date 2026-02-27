@@ -60,6 +60,15 @@ from open_webui.utils.access_control import has_permission
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
+# Type aliases for better readability
+EmitterType = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Configuration constants
+SECONDS_PER_DAY = 86400
+SHORT_MESSAGE_WORD_THRESHOLD = 8
+MAX_MEMORY_IDS_FOR_TOOLS = 50
+SIMILARITY_SCORE_PRECISION = 3
+
 STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
 INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
 
@@ -224,10 +233,10 @@ Tool call: (none)
 
 async def emit_status(
     description: str,
-    emitter: Any,
+    emitter: EmitterType,
     status: Literal["in_progress", "complete", "error"] = "complete",
-    extra_data: Optional[dict] = None,
-):
+    extra_data: dict[str, Any] | None = None,
+) -> None:
     if not emitter:
         raise ValueError("Emitter is required to emit status updates")
 
@@ -379,7 +388,7 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
             # Extract similarity score if available
             similarity_score = None
             if distances_batch is not None and doc_idx < len(distances_batch):
-                similarity_score = round(distances_batch[doc_idx], 3)
+                similarity_score = round(distances_batch[doc_idx], SIMILARITY_SCORE_PRECISION)
 
             mem = Memory(
                 mem_id=mem_id,
@@ -393,10 +402,56 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
     return memories
 
 
-def _run_detached(coro):
-    """Helper to run coroutine in detached thread"""
+T = TypeVar("T")
 
-    def _runner():
+
+def _run_async_in_thread(coro: Awaitable[T]) -> T:
+    """Run async coroutine in dedicated thread with new event loop.
+    
+    Use cases:
+        - Calling async code from sync context
+        - Avoiding event loop conflicts
+    
+    Args:
+        coro: Coroutine to execute
+    
+    Returns:
+        Result from coroutine execution
+    
+    Raises:
+        Exception: Re-raises any exception from coroutine
+    """
+    result_holder: dict[str, Any] = {}
+    error_holder: dict[str, Exception] = {}
+
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result_holder["result"] = loop.run_until_complete(coro)
+        except Exception as e:
+            error_holder["error"] = e
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "error" in error_holder:
+        raise error_holder["error"]
+
+    return result_holder["result"]
+
+
+def _run_detached(coro: Awaitable[Any]) -> None:
+    """Run coroutine in detached background thread (fire-and-forget).
+    
+    Args:
+        coro: Coroutine to execute in background
+    """
+
+    def _runner() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -777,6 +832,9 @@ class Filter:
             temperature = 0.3
             extra_args = {}
 
+        # Note: OpenAI SDK v1.0+ supports context manager, but we use direct instantiation
+        # for simplicity since the client is short-lived within this method scope.
+        # For long-lived clients, consider: with OpenAI(...) as client:
         client = OpenAI(api_key=api_key, base_url=api_url)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -927,6 +985,101 @@ class Filter:
             finally:
                 loop.close()
 
+    def _extract_memory_id(self, add_result: Any) -> str | None:
+        """Extract memory ID from add_memory API result.
+        
+        Args:
+            add_result: Result from add_memory API call
+        
+        Returns:
+            Memory ID if found, None otherwise
+        """
+        if isinstance(add_result, dict):
+            mem_id = add_result.get("id")
+            if isinstance(mem_id, str) and mem_id.strip():
+                return mem_id
+            nested = add_result.get("memory")
+            if isinstance(nested, dict):
+                nested_id = nested.get("id")
+                if isinstance(nested_id, str) and nested_id.strip():
+                    return nested_id
+        if hasattr(add_result, "id"):
+            attr_id = getattr(add_result, "id")
+            if isinstance(attr_id, str) and attr_id.strip():
+                return attr_id
+        return None
+    def _initialize_memory_expiry(self, mem_id: str, user_id: str) -> None:
+        """Initialize expiry record for new memory.
+        
+        Args:
+            mem_id: Memory ID to initialize expiry for
+            user_id: User ID who owns the memory
+        """
+        import time
+        now_timestamp = int(time.time())
+        expired_at = now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
+        existing = MemoryExpiries.get_by_mem_id(mem_id)
+        if existing:
+            MemoryExpiries.update_expired_at(mem_id, expired_at)
+            self.log(
+                f"reset expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+                level="debug",
+            )
+            return
+        MemoryExpiries.insert(
+            mem_id=mem_id,
+            user_id=user_id,
+            expired_at=expired_at,
+        )
+        self.log(
+            f"initialized expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+            level="debug",
+        )
+    async def _delete_memory_with_db(
+        self, action: MemoryDeleteAction, user: UserModel
+    ) -> None:
+        """Delete memory using database context.
+        
+        Args:
+            action: Delete action containing memory ID
+            user: User performing the deletion
+        """
+        from open_webui.internal.db import get_db
+        with get_db() as db:
+            await delete_memory_by_id(
+                memory_id=action.id,
+                request=Request(scope={"type": "http", "app": webui_app}),
+                user=user,
+                db=db,
+            )
+    async def _add_memory_with_expiry(
+        self, action: MemoryAddAction, user: UserModel
+    ) -> None:
+        """Add memory and initialize its expiry record.
+        
+        Args:
+            action: Add action containing memory content
+            user: User adding the memory
+        """
+        add_result = await add_memory(
+            request=Request(scope={"type": "http", "app": webui_app}),
+            form_data=AddMemoryForm(content=action.content),
+            user=user,
+        )
+        mem_id = self._extract_memory_id(add_result)
+        if not mem_id:
+            self.log(
+                "memory add returned no id; skipped expiry initialization",
+                level="warning",
+            )
+            return
+        try:
+            self._initialize_memory_expiry(mem_id, user.id)
+        except Exception as expiry_error:
+            self.log(
+                f"failed to initialize expiry for memory {mem_id}: {expiry_error}",
+                level="warning",
+            )
     def get_restricted_user_valve(
         self,
         user_valve_value: Optional[ValveType],
@@ -986,14 +1139,34 @@ class Filter:
         return admin_fallback
 
     def build_memory_query(self, messages: list[dict[str, Any]]) -> str:
-        """
-        Build a query string for memory retrieval from recent messages.
-
-        Strategy:
-        - Always include: last user message + last assistant response
-        - If user message is short (≤8 words), also include the previous assistant message
-
-        This gives embeddings enough context without overwhelming with noise.
+        """Build context-aware query for memory retrieval.
+        
+        Algorithm:
+            1. Extract last user message (required)
+            2. Include last assistant response (if exists)
+            3. If user message ≤ SHORT_MESSAGE_WORD_THRESHOLD words, add previous assistant context
+            4. Reverse to chronological order
+        
+        Rationale:
+            Short messages lack context for embedding similarity.
+            Including assistant responses provides semantic anchors.
+        
+        Examples:
+            >>> messages = [
+            ...     {"role": "user", "content": "What's my name?"},
+            ...     {"role": "assistant", "content": "Your name is Alice."}
+            ... ]
+            >>> query = self.build_memory_query(messages)
+            >>> assert "Alice" in query  # Context preserved
+        
+        Args:
+            messages: Conversation history (newest last)
+        
+        Returns:
+            Query string for vector similarity search
+        
+        Raises:
+            ValueError: If no user message found in messages
         """
         query_parts = []
 
@@ -1013,7 +1186,7 @@ class Filter:
         user_word_count = len(last_user_msg.split())
 
         # Check if we should include extra context for short messages
-        include_extra_context = user_word_count <= 8
+        include_extra_context = user_word_count <= SHORT_MESSAGE_WORD_THRESHOLD
 
         # Build query from most recent to older messages
         # Add last assistant response (if exists)
@@ -1120,27 +1293,12 @@ class Filter:
         return related_memories
 
     def _run_async_blocking(self, coro: Awaitable[Any]) -> Any:
-        result_holder: dict[str, Any] = {}
-        error_holder: dict[str, Exception] = {}
-
-        def _runner() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result_holder["result"] = loop.run_until_complete(coro)
-            except Exception as e:
-                error_holder["error"] = e
-            finally:
-                loop.close()
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join()
-
-        if "error" in error_holder:
-            raise error_holder["error"]
-
-        return result_holder.get("result")
+        """Run async coroutine synchronously (blocks until complete).
+        
+        Deprecated: Use _run_async_in_thread instead.
+        Kept for backward compatibility.
+        """
+        return _run_async_in_thread(coro)
 
     def build_inlet_memory_context(self, memories: list[Memory]) -> str:
         memory_lines = []
@@ -1309,12 +1467,12 @@ class Filter:
                     # Extend expiry from existing expired_at, not from now
                     # This ensures we truly "extend by N days" rather than "reset to N days from now"
                     extended_from_existing = int(existing.expired_at) + (  # type: ignore
-                        self.valves.extension_days * 86400
+                        self.valves.extension_days * SECONDS_PER_DAY
                     )
 
                     # Ensure at least extension_days from now (handles already-expired memories)
                     extended_from_now = now_timestamp + (
-                        self.valves.extension_days * 86400
+                        self.valves.extension_days * SECONDS_PER_DAY
                     )
 
                     # Take the maximum to ensure we always give at least extension_days
@@ -1322,14 +1480,14 @@ class Filter:
 
                     # Apply maximum expiry limit to prevent indefinite extension
                     max_allowed_expired_at = now_timestamp + (
-                        self.valves.max_expiry_days * 86400
+                        self.valves.max_expiry_days * SECONDS_PER_DAY
                     )
                     new_expired_at = min(extended_expired_at, max_allowed_expired_at)
 
                     expiry_table.update_expired_at(memory.mem_id, new_expired_at)
                     stats["boosted"] += 1
 
-                    days_extended = (new_expired_at - int(existing.expired_at)) / 86400  # type: ignore
+                    days_extended = (new_expired_at - int(existing.expired_at)) / SECONDS_PER_DAY  # type: ignore
                     self.log(
                         f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
                         f"(requested {self.valves.extension_days}, capped at {self.valves.max_expiry_days} days from now)",
@@ -1338,7 +1496,7 @@ class Filter:
                 else:
                     # Create new record
                     new_expired_at = now_timestamp + (
-                        self.valves.initial_expiry_days * 86400
+                        self.valves.initial_expiry_days * SECONDS_PER_DAY
                     )
                     expiry_table.insert(
                         mem_id=memory.mem_id,
@@ -1418,12 +1576,12 @@ class Filter:
 
         try:
             existing_ids = [m.mem_id for m in related_memories]
-            if len(existing_ids) > 50:
+            if len(existing_ids) > MAX_MEMORY_IDS_FOR_TOOLS:
                 self.log(
-                    f"truncating memory action ID constraints from {len(existing_ids)} to 50",
+                    f"truncating memory action ID constraints from {len(existing_ids)} to {MAX_MEMORY_IDS_FOR_TOOLS}",
                     level="warning",
                 )
-                existing_ids = existing_ids[:50]
+                existing_ids = existing_ids[:MAX_MEMORY_IDS_FOR_TOOLS]
 
             tool_models, tool_definitions, tool_choice = build_memory_action_tools(
                 existing_ids
@@ -1482,83 +1640,12 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
-        def _extract_memory_id(add_result: Any) -> Optional[str]:
-            if isinstance(add_result, dict):
-                mem_id = add_result.get("id")
-                if isinstance(mem_id, str) and mem_id.strip():
-                    return mem_id
-                nested = add_result.get("memory")
-                if isinstance(nested, dict):
-                    nested_id = nested.get("id")
-                    if isinstance(nested_id, str) and nested_id.strip():
-                        return nested_id
-            if hasattr(add_result, "id"):
-                attr_id = getattr(add_result, "id")
-                if isinstance(attr_id, str) and attr_id.strip():
-                    return attr_id
-            return None
-
-        def _initialize_memory_expiry(mem_id: str) -> None:
-            import time
-
-            now_timestamp = int(time.time())
-            expired_at = now_timestamp + (self.valves.initial_expiry_days * 86400)
-            existing = MemoryExpiries.get_by_mem_id(mem_id)
-
-            if existing:
-                MemoryExpiries.update_expired_at(mem_id, expired_at)
-                self.log(
-                    f"reset expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
-                    level="debug",
-                )
-                return
-
-            MemoryExpiries.insert(
-                mem_id=mem_id,
-                user_id=user.id,
-                expired_at=expired_at,
-            )
-            self.log(
-                f"initialized expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
-                level="debug",
-            )
-
-        async def _delete_with_db(action: MemoryDeleteAction) -> None:
-            with get_db() as db:
-                await delete_memory_by_id(
-                    memory_id=action.id,
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    user=user,
-                    db=db,
-                )
-
-        async def _add_with_expiry(action: MemoryAddAction) -> None:
-            add_result = await add_memory(
-                request=Request(scope={"type": "http", "app": webui_app}),
-                form_data=AddMemoryForm(content=action.content),
-                user=user,
-            )
-            mem_id = _extract_memory_id(add_result)
-            if not mem_id:
-                self.log(
-                    "memory add returned no id; skipped expiry initialization",
-                    level="warning",
-                )
-                return
-
-            try:
-                _initialize_memory_expiry(mem_id)
-            except Exception as expiry_error:
-                self.log(
-                    f"failed to initialize expiry for memory {mem_id}: {expiry_error}",
-                    level="warning",
-                )
 
         # Group actions and define handlers
         operations: dict[str, dict[str, Any]] = {
             "delete": {
                 "actions": [a for a in actions if a.action == "delete"],
-                "handler": _delete_with_db,
+                "handler": lambda a: self._delete_memory_with_db(a, user),
                 "log_msg": lambda a: f"deleted memory. id={a.id}",
                 "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
                 "skip_empty": lambda a: False,
@@ -1579,7 +1666,7 @@ class Filter:
             },
             "add": {
                 "actions": [a for a in actions if a.action == "add"],
-                "handler": _add_with_expiry,
+                "handler": lambda a: self._add_memory_with_expiry(a, user),
                 "log_msg": lambda a: f"added memory. content={a.content}",
                 "error_msg": lambda a, e: f"failed to add memory: {e}",
                 "skip_empty": lambda a: not a.content.strip(),
