@@ -152,7 +152,7 @@ async def test_valid_mixed_actions_deterministic_order(
             MemoryUpdateAction(
                 action="update",
                 id="mem-002",
-                new_content="User works at NewCo",
+                content="User works at NewCo",
             ),
         ]
     )

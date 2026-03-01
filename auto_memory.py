@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.4
+version: 1.4.5
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,7 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
-- Version 1.4.4: Added no-op memory planning support for cases with no add/update/delete actions.
+- Version 1.4.5: Unified field naming - changed update_memory field from 'new_content' to 'content' for consistency with add_memory
 - Version 1.4.3: Refactored code structure for readability and maintainability.
 - Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
 - Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
@@ -294,7 +294,7 @@ class MemoryAddAction(StrictBaseModel):
 class MemoryUpdateAction(StrictBaseModel):
     action: Literal["update"] = Field(..., description="Action type (update)")
     id: str = Field(..., description="ID of the memory to update")
-    new_content: str = Field(..., description="New content for the memory")
+    content: str = Field(..., description="New content for the memory")
 
 
 class MemoryDeleteAction(StrictBaseModel):
@@ -308,7 +308,7 @@ class MemoryAddToolRequest(StrictBaseModel):
 
 class MemoryUpdateToolRequest(StrictBaseModel):
     id: str = Field(..., description="ID of the memory to update")
-    new_content: str = Field(..., description="New content for the memory")
+    content: str = Field(..., description="New content for the memory")
 
 
 class MemoryDeleteToolRequest(StrictBaseModel):
@@ -355,7 +355,7 @@ def build_memory_action_tools(
         dynamic_update_model = create_model(
             "DynamicMemoryUpdateToolRequest",
             id=(id_literal_type, Field(..., description="ID of the memory to update")),  # type: ignore[valid-type]
-            new_content=(str, Field(..., description="New content for the memory")),
+            content=(str, Field(..., description="New content for the memory")),
             __base__=StrictBaseModel,
         )
         dynamic_delete_model = create_model(
@@ -999,7 +999,7 @@ class Filter:
                         MemoryUpdateAction(
                             action="update",
                             id=parsed_update.id,
-                            new_content=parsed_update.new_content,
+                            content=parsed_update.content,
                         )
                     )
                 elif tool_name == "delete_memory":
@@ -1743,12 +1743,12 @@ class Filter:
                 "handler": lambda a: update_memory_by_id(
                     memory_id=a.id,
                     request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=MemoryUpdateModel(content=a.new_content),
+                    form_data=MemoryUpdateModel(content=a.content),
                     user=user,
                 ),
                 "log_msg": lambda a: f"updated memory. id={a.id}",
                 "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
-                "skip_empty": lambda a: not a.new_content.strip(),
+                "skip_empty": lambda a: not a.content.strip(),
                 "status_verb": "updated",
             },
             "add": {
