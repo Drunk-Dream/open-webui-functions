@@ -1,14 +1,19 @@
 """
 title: Auto Memory
-author: @nokodo
+author: @Drunk-Dream
 description: automatically identify and store valuable information from chats as Memories.
-author_email: nokodo@nokodo.net
-author_url: https://nokodo.net
-repository_url: https://nokodo.net/github/open-webui-extensions
+author_email: dongmh3@outlook.com
+author_url: https://github.com/Drunk-Dream
+repository_url: https://github.com/Drunk-Dream/open-webui-functions
 version: 1.4.4
 required_open_webui_version: >= 0.8.1
-funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
+
+Forked from:
+  Original Author: @nokodo
+  Original Repository: https://nokodo.net/github/open-webui-extensions
+  Original Funding: https://ko-fi.com/nokodo
+
 Compatibility Note:
 - Version 1.4.4: Added no-op memory planning support for cases with no add/update/delete actions.
 - Version 1.4.3: Refactored code structure for readability and maintainability.
@@ -1929,8 +1934,10 @@ class Filter:
             return body
 
         _run_detached(
-            self.auto_memory(  # pyright: ignore[reportCallIssue]
-                body.get("messages", []),  # type: ignore[arg-type]
+            self.auto_memory(
+                messages=body.get("messages", []),  # type: ignore[arg-type]
+                user=user,
+                emitter=__event_emitter__,
             )
         )
 
