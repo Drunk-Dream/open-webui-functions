@@ -354,13 +354,13 @@ def build_memory_action_tools(
         id_literal_type = Literal[tuple(existing_ids)]  # type: ignore[misc,valid-type]
         dynamic_update_model = create_model(
             "DynamicMemoryUpdateToolRequest",
-            id=(id_literal_type, ...),  # type: ignore[valid-type]
-            new_content=(str, ...),
+            id=(id_literal_type, Field(..., description="ID of the memory to update")),  # type: ignore[valid-type]
+            new_content=(str, Field(..., description="New content for the memory")),
             __base__=StrictBaseModel,
         )
         dynamic_delete_model = create_model(
             "DynamicMemoryDeleteToolRequest",
-            id=(id_literal_type, ...),  # type: ignore[valid-type]
+            id=(id_literal_type, Field(..., description="ID of the memory to delete")),  # type: ignore[valid-type]
             __base__=StrictBaseModel,
         )
         tool_models["update_memory"] = cast(Type[BaseModel], dynamic_update_model)
