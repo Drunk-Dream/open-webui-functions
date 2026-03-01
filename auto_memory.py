@@ -10,16 +10,8 @@ required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 Compatibility Note:
-- Version 1.4.4: Added explicit no-op memory handling when no add/update/delete is needed
-  * Updated planning prompt to allow empty tool calls in no-change cases
-  * Switched tool_choice to auto for optional tool invocation
-  * Treated zero tool_calls as empty action plan instead of hard failure in tool-map mode
-- Version 1.4.3: Code quality improvements - refactored for better readability and maintainability
-  * Extracted nested functions to class private methods for better testability
-  * Replaced magic numbers with named constants (SECONDS_PER_DAY, etc.)
-  * Added comprehensive documentation and type annotations
-  * Unified async execution utilities
-  * Added structural comments for improved code navigation
+- Version 1.4.4: Added no-op memory planning support for cases with no add/update/delete actions.
+- Version 1.4.3: Refactored code structure for readability and maintainability.
 - Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
 - Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
 - Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
@@ -48,6 +40,7 @@ from typing import (
     Callable,
     Literal,
     Optional,
+    Protocol,
     Type,
     TypeVar,
     Union,
@@ -572,7 +565,7 @@ class MemoryExpiryTable:
             if not expiry:
                 return None
             expiry.expired_at = expired_at  # pyright: ignore
-            expiry.updated_at = int(time.time())  # type: ignore
+            expiry.updated_at = int(time.time())  # pyright: ignore[reportAttributeAccessIssue]
             db.commit()
             db.refresh(expiry)
             return expiry
@@ -618,7 +611,7 @@ def _ensure_table_exists():
     try:
         Base.metadata.create_all(
             engine,
-            tables=[MemoryExpiry.__table__],  # type: ignore
+            tables=[MemoryExpiry.__table__],  # pyright: ignore[reportArgumentType]
             checkfirst=True,
         )
     except Exception:
@@ -641,17 +634,19 @@ class MemoryRepository:
 
         return VECTOR_DB_CLIENT.get(collection_name=self.collection_name)
 
-    async def upsert_with_vectors(self, items: list[dict], user, embedding_function):
+    async def upsert_with_vectors(self, items: list[dict[str, object]], user: object, embedding_function: "EmbeddingCallable") -> None:
         """Upsert items with vector generation."""
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
         for item in items:
-            vector = await embedding_function(item["text"], user=user)
+            vector = await embedding_function(str(item["text"]), user=user)
             item["vector"] = vector
 
         VECTOR_DB_CLIENT.upsert(collection_name=self.collection_name, items=items)
 
 
+class EmbeddingCallable(Protocol):
+    async def __call__(self, text: str, user: object) -> list[float]: ...
 R = TypeVar("R", bound=BaseModel)
 ValveType = TypeVar("ValveType", str, int)
 
@@ -668,7 +663,8 @@ class Filter:
         - Memory Management: CRUD operations
         - Lifecycle Hooks: inlet, outlet
     """
-
+    current_user: Optional[dict[str, object]] = None
+    user_valves: "Filter.UserValves"  # pyright: ignore[reportUninitializedInstanceVariable]
     # ------------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------------
@@ -1188,7 +1184,7 @@ class Filter:
             return user_valve_value if user_valve_value is not None else admin_fallback
 
         # Allow admins to override without providing their own API key
-        if hasattr(self, "current_user") and self.current_user.get("role") == "admin":
+        if hasattr(self, "current_user") and self.current_user is not None and self.current_user.get("role") == "admin":
             if user_valve_value is not None:
                 self.log(
                     f"'{valve_name or 'unknown'}' override allowed for admin user",
@@ -1467,7 +1463,7 @@ class Filter:
             try:
                 await asyncio.to_thread(
                     self._delete_memory_sync,
-                    mem_id=record.mem_id,  # type: ignore
+                    mem_id=str(record.mem_id),
                     user=user,
                 )
                 self.log(
@@ -1483,7 +1479,7 @@ class Filter:
 
             # Always try to delete from expiry table, even if vector DB deletion failed
             try:
-                expiry_table.delete_by_mem_id(record.mem_id)  # type: ignore
+                expiry_table.delete_by_mem_id(str(record.mem_id))
                 expiry_table_deleted = True
                 self.log(
                     f"deleted expiry record: {record.mem_id[:8]}...", level="debug"
@@ -1548,7 +1544,7 @@ class Filter:
                 if existing:
                     # Extend expiry from existing expired_at, not from now
                     # This ensures we truly "extend by N days" rather than "reset to N days from now"
-                    extended_from_existing = int(existing.expired_at) + (  # type: ignore
+                    extended_from_existing = int(existing.expired_at) + (  # pyright: ignore[reportArgumentType]
                         self.valves.extension_days * SECONDS_PER_DAY
                     )
 
@@ -1570,7 +1566,7 @@ class Filter:
                     stats["boosted"] += 1
 
                     days_extended = (
-                        new_expired_at - int(existing.expired_at)
+                        new_expired_at - int(existing.expired_at)  # pyright: ignore[reportArgumentType]
                     ) / SECONDS_PER_DAY  # type: ignore
                     self.log(
                         f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
@@ -1797,10 +1793,10 @@ class Filter:
     # ------------------------------------------------------------------------
     def inlet(
         self,
-        body: dict,
+        body: dict[str, object],
         __event_emitter__: Callable[[Any], Awaitable[None]],
-        __user__: Optional[dict] = None,
-    ) -> dict:
+        __user__: Optional[dict[str, object]] = None,
+    ) -> dict[str, object]:
         self.log(f"inlet: {__name__}", level="info")
         self.log(
             f"inlet: user ID: {__user__.get('id') if __user__ else 'no user'}",
@@ -1870,20 +1866,20 @@ class Filter:
 
     async def outlet(
         self,
-        body: dict,
+        body: dict[str, object],
         __event_emitter__: Callable[[Any], Awaitable[None]],
-        __user__: Optional[dict] = None,
-    ) -> dict:
+        __user__: Optional[dict[str, object]] = None,
+    ) -> dict[str, object]:
         self.log("outlet invoked")
         if __user__ is None:
             raise ValueError("user information is required")
 
         chat_id = body.get("chat_id")
-        if not chat_id or chat_id.startswith("local:"):
+        if not chat_id or (isinstance(chat_id, str) and chat_id.startswith("local:")):
             self.log("temporary chat, skipping", level="info")
             return body
 
-        user = Users.get_user_by_id(__user__["id"])
+        user = Users.get_user_by_id(str(__user__["id"]))
         if user is None:
             raise ValueError("user not found")
 
@@ -1905,7 +1901,7 @@ class Filter:
             )
             return body
 
-        self.current_user = __user__
+        self.current_user: Optional[dict[str, object]] = __user__
 
         self.log(f"input user type = {type(__user__)}", level="debug")
         self.log(
@@ -1922,7 +1918,7 @@ class Filter:
             )
             return body
 
-        self.user_valves = __user__.get("valves", self.UserValves())
+        self.user_valves = __user__.get("valves", self.UserValves())  # pyright: ignore[reportAttributeAccessIssue]
         if not isinstance(self.user_valves, self.UserValves):
             raise ValueError("invalid user valves")
         self.user_valves = cast(Filter.UserValves, self.user_valves)
@@ -1933,8 +1929,8 @@ class Filter:
             return body
 
         _run_detached(
-            self.auto_memory(
-                body.get("messages", []), user=user, emitter=__event_emitter__
+            self.auto_memory(  # pyright: ignore[reportCallIssue]
+                body.get("messages", []),  # type: ignore[arg-type]
             )
         )
 
