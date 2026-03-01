@@ -5,11 +5,15 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.4.3
+version: 1.4.4
 required_open_webui_version: >= 0.8.1
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 Compatibility Note:
+- Version 1.4.4: Added explicit no-op memory handling when no add/update/delete is needed
+  * Updated planning prompt to allow empty tool calls in no-change cases
+  * Switched tool_choice to auto for optional tool invocation
+  * Treated zero tool_calls as empty action plan instead of hard failure in tool-map mode
 - Version 1.4.3: Code quality improvements - refactored for better readability and maintainability
   * Extracted nested functions to class private methods for better testability
   * Replaced magic numbers with named constants (SECONDS_PER_DAY, etc.)
@@ -96,7 +100,7 @@ INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
 UNIFIED_SYSTEM_PROMPT = """\
 You maintain a collection of Memories: individual facts or journal entries about a user, each automatically timestamped on creation or update.
 
-Your only job here is to decide what memory actions to take. You must respond with tool calls only. Do not write any normal text response.
+Your only job here is to decide what memory actions to take. If memory changes are needed, respond with tool calls only. If no memory changes are needed, return no tool calls.
 
 <output_rules>
 - Use only these tools: `add_memory`, `update_memory`, `delete_memory`.
@@ -104,6 +108,7 @@ Your only job here is to decide what memory actions to take. You must respond wi
 - You may call tools multiple times when multiple memory changes are needed.
 - If no changes are needed, return no tool calls.
 - Never output plain text. The tool call is your entire response.
+- In no-change cases, leave `tool_calls` empty and do not output any content text.
 - Never store credentials, passwords, API keys, tokens, or any secrets.
 </output_rules>
 
@@ -340,7 +345,7 @@ class Memory(BaseModel):
 # --- Model Utilities ---
 def build_memory_action_tools(
     existing_ids: list[str],
-) -> tuple[dict[str, Type[BaseModel]], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Type[BaseModel]], list[dict[str, Any]], Literal["auto"]]:
     """Build single-memory tool schemas for add/update/delete actions."""
 
     tool_models: dict[str, Type[BaseModel]] = {
@@ -381,7 +386,7 @@ def build_memory_action_tools(
             }
         )
 
-    return tool_models, tool_definitions, "required"
+    return tool_models, tool_definitions, "auto"
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -414,7 +419,9 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
             # Extract similarity score if available
             similarity_score = None
             if distances_batch is not None and doc_idx < len(distances_batch):
-                similarity_score = round(distances_batch[doc_idx], SIMILARITY_SCORE_PRECISION)
+                similarity_score = round(
+                    distances_batch[doc_idx], SIMILARITY_SCORE_PRECISION
+                )
 
             mem = Memory(
                 mem_id=mem_id,
@@ -437,17 +444,17 @@ T = TypeVar("T")
 
 def _run_async_in_thread(coro: Awaitable[T]) -> T:
     """Run async coroutine in dedicated thread with new event loop.
-    
+
     Use cases:
         - Calling async code from sync context
         - Avoiding event loop conflicts
-    
+
     Args:
         coro: Coroutine to execute
-    
+
     Returns:
         Result from coroutine execution
-    
+
     Raises:
         Exception: Re-raises any exception from coroutine
     """
@@ -476,7 +483,7 @@ def _run_async_in_thread(coro: Awaitable[T]) -> T:
 
 def _run_detached(coro: Awaitable[Any]) -> None:
     """Run coroutine in detached background thread (fire-and-forget).
-    
+
     Args:
         coro: Coroutine to execute in background
     """
@@ -496,6 +503,7 @@ def _run_detached(coro: Awaitable[Any]) -> None:
 
 
 # --- Database Models ---
+
 
 class MemoryExpiry(Base):
     """SQLAlchemy model for tracking memory expiration times."""
@@ -653,14 +661,14 @@ ValveType = TypeVar("ValveType", str, int)
 # ============================================================================
 class Filter:
     """Main plugin class for Auto Memory functionality.
-    
+
     Architecture:
         - Configuration: Valves, UserValves
         - LLM Integration: query_openai_sdk
         - Memory Management: CRUD operations
         - Lifecycle Hooks: inlet, outlet
     """
-    
+
     # ------------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------------
@@ -947,6 +955,12 @@ class Filter:
 
         tool_calls = message.tool_calls or []
         if len(tool_calls) == 0:
+            self.log(
+                f"no tool calls returned (finish_reason={response.choices[0].finish_reason}); treating as no-op",
+                level="debug",
+            )
+            if isinstance(response_model, dict):
+                return MemoryActionRequestStub(actions=[])
             raise ValueError(
                 f"expected exactly one tool call but got zero. finish_reason={response.choices[0].finish_reason}"
             )
@@ -1040,10 +1054,10 @@ class Filter:
     # ------------------------------------------------------------------------
     def _extract_memory_id(self, add_result: Any) -> str | None:
         """Extract memory ID from add_memory API result.
-        
+
         Args:
             add_result: Result from add_memory API call
-        
+
         Returns:
             Memory ID if found, None otherwise
         """
@@ -1061,14 +1075,16 @@ class Filter:
             if isinstance(attr_id, str) and attr_id.strip():
                 return attr_id
         return None
+
     def _initialize_memory_expiry(self, mem_id: str, user_id: str) -> None:
         """Initialize expiry record for new memory.
-        
+
         Args:
             mem_id: Memory ID to initialize expiry for
             user_id: User ID who owns the memory
         """
         import time
+
         now_timestamp = int(time.time())
         expired_at = now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
         existing = MemoryExpiries.get_by_mem_id(mem_id)
@@ -1088,16 +1104,18 @@ class Filter:
             f"initialized expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
             level="debug",
         )
+
     async def _delete_memory_with_db(
         self, action: MemoryDeleteAction, user: UserModel
     ) -> None:
         """Delete memory using database context.
-        
+
         Args:
             action: Delete action containing memory ID
             user: User performing the deletion
         """
         from open_webui.internal.db import get_db
+
         with get_db() as db:
             await delete_memory_by_id(
                 memory_id=action.id,
@@ -1105,11 +1123,12 @@ class Filter:
                 user=user,
                 db=db,
             )
+
     async def _add_memory_with_expiry(
         self, action: MemoryAddAction, user: UserModel
     ) -> None:
         """Add memory and initialize its expiry record.
-        
+
         Args:
             action: Add action containing memory content
             user: User adding the memory
@@ -1133,6 +1152,7 @@ class Filter:
                 f"failed to initialize expiry for memory {mem_id}: {expiry_error}",
                 level="warning",
             )
+
     def get_restricted_user_valve(
         self,
         user_valve_value: Optional[ValveType],
@@ -1196,17 +1216,17 @@ class Filter:
     # ------------------------------------------------------------------------
     def build_memory_query(self, messages: list[dict[str, Any]]) -> str:
         """Build context-aware query for memory retrieval.
-        
+
         Algorithm:
             1. Extract last user message (required)
             2. Include last assistant response (if exists)
             3. If user message ≤ SHORT_MESSAGE_WORD_THRESHOLD words, add previous assistant context
             4. Reverse to chronological order
-        
+
         Rationale:
             Short messages lack context for embedding similarity.
             Including assistant responses provides semantic anchors.
-        
+
         Examples:
             >>> messages = [
             ...     {"role": "user", "content": "What's my name?"},
@@ -1214,13 +1234,13 @@ class Filter:
             ... ]
             >>> query = self.build_memory_query(messages)
             >>> assert "Alice" in query  # Context preserved
-        
+
         Args:
             messages: Conversation history (newest last)
-        
+
         Returns:
             Query string for vector similarity search
-        
+
         Raises:
             ValueError: If no user message found in messages
         """
@@ -1353,7 +1373,7 @@ class Filter:
     # ------------------------------------------------------------------------
     def _run_async_blocking(self, coro: Awaitable[Any]) -> Any:
         """Run async coroutine synchronously (blocks until complete).
-        
+
         Deprecated: Use _run_async_in_thread instead.
         Kept for backward compatibility.
         """
@@ -1549,7 +1569,9 @@ class Filter:
                     expiry_table.update_expired_at(memory.mem_id, new_expired_at)
                     stats["boosted"] += 1
 
-                    days_extended = (new_expired_at - int(existing.expired_at)) / SECONDS_PER_DAY  # type: ignore
+                    days_extended = (
+                        new_expired_at - int(existing.expired_at)
+                    ) / SECONDS_PER_DAY  # type: ignore
                     self.log(
                         f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
                         f"(requested {self.valves.extension_days}, capped at {self.valves.max_expiry_days} days from now)",
@@ -1704,7 +1726,6 @@ class Filter:
             )
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
-
 
         # Group actions and define handlers
         operations: dict[str, dict[str, Any]] = {

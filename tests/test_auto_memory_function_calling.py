@@ -4,13 +4,13 @@ Unit tests for tool-calling planner and mutation guardrails in auto_memory.py.
 Tests cover:
 1. Valid mixed actions trigger deterministic delete->update->add execution order
 2. Invalid update/delete ID rejected and no mutations
-3. Provider response without tool_calls hard-fails and no mutations
+3. Provider response without tool_calls is treated as no-op and no mutations
 4. Tool args with extra keys rejected by strict schema and no mutations
 """
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -99,7 +99,7 @@ def make_tool_calls_response(
                 message=ChatCompletionMessage(
                     role="assistant",
                     content=None,
-                    tool_calls=message_tool_calls,
+                    tool_calls=cast(Any, message_tool_calls),
                 ),
                 finish_reason="tool_calls",
             )
@@ -243,9 +243,9 @@ async def test_invalid_id_rejected_no_mutations(
 
 
 @pytest.mark.asyncio
-async def test_no_tool_calls_hard_fails_no_mutations(mock_user, mock_emitter):
+async def test_no_tool_calls_noop_no_mutations(mock_user, mock_emitter):
     """
-    Test 3: Provider response without tool_calls hard-fails and no mutations.
+    Test 3: Provider response without tool_calls is treated as no-op and no mutations.
     """
     filter_instance = Filter()
     filter_instance.valves.debug_mode = False
@@ -271,18 +271,16 @@ async def test_no_tool_calls_hard_fails_no_mutations(mock_user, mock_emitter):
         mock_openai_class.return_value = mock_client
         mock_client.chat.completions.create.return_value = mock_response
 
-        # Attempt to call query_openai_sdk - should raise ValueError
-        with pytest.raises(ValueError) as exc_info:
-            await filter_instance.query_openai_sdk(
-                system_prompt="test",
-                user_message="test",
-                response_model=tool_models,
-                tools=tool_definitions,
-                tool_choice=tool_choice,
-            )
+        action_plan = await filter_instance.query_openai_sdk(
+            system_prompt="test",
+            user_message="test",
+            response_model=tool_models,
+            tools=tool_definitions,
+            tool_choice=tool_choice,
+        )
 
-        # Verify error message
-        assert "expected exactly one tool call but got zero" in str(exc_info.value)
+        assert isinstance(action_plan, MemoryActionRequestStub)
+        assert action_plan.actions == []
 
     # No mutations should have occurred
     assert len(mutation_calls) == 0
