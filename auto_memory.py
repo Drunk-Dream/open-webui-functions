@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import (
     Any,
@@ -90,6 +91,16 @@ SIMILARITY_SCORE_PRECISION = 3
 
 STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
 INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
+TOOL_DESCRIPTIONS = {
+    "add_memory": "Add exactly one memory.",
+    "update_memory": "Update exactly one existing memory by ID.",
+    "delete_memory": "Delete exactly one existing memory by ID.",
+}
+ACTION_ORDER: tuple[Literal["delete", "update", "add"], ...] = (
+    "delete",
+    "update",
+    "add",
+)
 
 # ============================================================================
 # 3. SYSTEM PROMPTS (Business Rules)
@@ -366,23 +377,17 @@ def build_memory_action_tools(
         tool_models["update_memory"] = cast(Type[BaseModel], dynamic_update_model)
         tool_models["delete_memory"] = cast(Type[BaseModel], dynamic_delete_model)
 
-    tool_definitions: list[dict[str, Any]] = []
-    for tool_name, model in tool_models.items():
-        description = {
-            "add_memory": "Add exactly one memory.",
-            "update_memory": "Update exactly one existing memory by ID.",
-            "delete_memory": "Delete exactly one existing memory by ID.",
-        }[tool_name]
-        tool_definitions.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "description": description,
-                    "parameters": model.model_json_schema(),
-                },
-            }
-        )
+    tool_definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": TOOL_DESCRIPTIONS[tool_name],
+                "parameters": model.model_json_schema(),
+            },
+        }
+        for tool_name, model in tool_models.items()
+    ]
 
     return tool_models, tool_definitions, "auto"
 
@@ -440,6 +445,15 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
 T = TypeVar("T")
 
 
+def _run_coro_in_new_loop(coro: Awaitable[T]) -> T:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def _run_async_in_thread(coro: Awaitable[T]) -> T:
     """Run async coroutine in dedicated thread with new event loop.
 
@@ -460,14 +474,10 @@ def _run_async_in_thread(coro: Awaitable[T]) -> T:
     error_holder: dict[str, Exception] = {}
 
     def _runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            result_holder["result"] = loop.run_until_complete(coro)
+            result_holder["result"] = _run_coro_in_new_loop(coro)
         except Exception as e:
             error_holder["error"] = e
-        finally:
-            loop.close()
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
@@ -487,17 +497,17 @@ def _run_detached(coro: Awaitable[Any]) -> None:
     """
 
     def _runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(coro)
+            _run_coro_in_new_loop(coro)
         except Exception as e:
             logging.getLogger(__name__).exception("Detached task failed: %s", e)
-        finally:
-            loop.close()
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
+
+
+def _build_webui_request() -> Request:
+    return Request(scope={"type": "http", "app": webui_app})
 
 
 # --- Database Models ---
@@ -531,8 +541,6 @@ class MemoryExpiryTable:
         db: Optional[Session] = None,
     ) -> Optional[MemoryExpiry]:
         """Insert a new memory expiry record."""
-        import time
-
         with get_db_context(db) as db:
             now = int(time.time())
             expiry = MemoryExpiry(
@@ -563,8 +571,6 @@ class MemoryExpiryTable:
         db: Optional[Session] = None,
     ) -> Optional[MemoryExpiry]:
         """Update the expiration time for a memory."""
-        import time
-
         with get_db_context(db) as db:
             expiry = db.get(MemoryExpiry, mem_id)
             if not expiry:
@@ -639,7 +645,12 @@ class MemoryRepository:
 
         return VECTOR_DB_CLIENT.get(collection_name=self.collection_name)
 
-    async def upsert_with_vectors(self, items: list[dict[str, object]], user: object, embedding_function: "EmbeddingCallable") -> None:
+    async def upsert_with_vectors(
+        self,
+        items: list[dict[str, object]],
+        user: object,
+        embedding_function: "EmbeddingCallable",
+    ) -> None:
         """Upsert items with vector generation."""
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
@@ -652,6 +663,8 @@ class MemoryRepository:
 
 class EmbeddingCallable(Protocol):
     async def __call__(self, text: str, user: object) -> list[float]: ...
+
+
 R = TypeVar("R", bound=BaseModel)
 ValveType = TypeVar("ValveType", str, int)
 
@@ -668,8 +681,10 @@ class Filter:
         - Memory Management: CRUD operations
         - Lifecycle Hooks: inlet, outlet
     """
+
     current_user: Optional[dict[str, object]] = None
     user_valves: "Filter.UserValves"  # pyright: ignore[reportUninitializedInstanceVariable]
+
     # ------------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------------
@@ -899,18 +914,18 @@ class Filter:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
+        request_args: dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            **extra_args,
+        }
+        if tools is not None:
+            request_args["tools"] = cast(Any, tools)
+        if tool_choice is not None:
+            request_args["tool_choice"] = cast(Any, tool_choice)
 
         if response_model is None:
-            request_args: dict[str, Any] = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": temperature,
-                **extra_args,
-            }
-            if tools is not None:
-                request_args["tools"] = cast(Any, tools)
-            if tool_choice is not None:
-                request_args["tool_choice"] = cast(Any, tool_choice)
             response = client.chat.completions.create(**request_args)
             self.log(f"sdk response: {response}", level="debug")
 
@@ -933,16 +948,6 @@ class Filter:
             raise ValueError(
                 "response_model requires tools to be provided for tool-calling path"
             )
-
-        request_args: dict[str, Any] = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "tools": cast(Any, tools),
-            **extra_args,
-        }
-        if tool_choice is not None:
-            request_args["tool_choice"] = cast(Any, tool_choice)
 
         response = client.chat.completions.create(**request_args)
         self.log(f"tool-call sdk response: {response}", level="debug")
@@ -1031,24 +1036,16 @@ class Filter:
     def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
         """Synchronous helper for deleting memory in thread pool."""
         from open_webui.internal.db import get_db
-        from open_webui.main import app as webui_app
 
         with get_db() as db:
-            import asyncio
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    delete_memory_by_id(
-                        memory_id=mem_id,
-                        request=Request(scope={"type": "http", "app": webui_app}),
-                        user=user,
-                        db=db,
-                    )
+            _run_coro_in_new_loop(
+                delete_memory_by_id(
+                    memory_id=mem_id,
+                    request=_build_webui_request(),
+                    user=user,
+                    db=db,
                 )
-            finally:
-                loop.close()
+            )
 
     # ------------------------------------------------------------------------
     # Memory CRUD Operations (Private)
@@ -1084,8 +1081,6 @@ class Filter:
             mem_id: Memory ID to initialize expiry for
             user_id: User ID who owns the memory
         """
-        import time
-
         now_timestamp = int(time.time())
         expired_at = now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
         existing = MemoryExpiries.get_by_mem_id(mem_id)
@@ -1120,7 +1115,7 @@ class Filter:
         with get_db() as db:
             await delete_memory_by_id(
                 memory_id=action.id,
-                request=Request(scope={"type": "http", "app": webui_app}),
+                request=_build_webui_request(),
                 user=user,
                 db=db,
             )
@@ -1135,7 +1130,7 @@ class Filter:
             user: User adding the memory
         """
         add_result = await add_memory(
-            request=Request(scope={"type": "http", "app": webui_app}),
+            request=_build_webui_request(),
             form_data=AddMemoryForm(content=action.content),
             user=user,
         )
@@ -1189,7 +1184,11 @@ class Filter:
             return user_valve_value if user_valve_value is not None else admin_fallback
 
         # Allow admins to override without providing their own API key
-        if hasattr(self, "current_user") and self.current_user is not None and self.current_user.get("role") == "admin":
+        if (
+            hasattr(self, "current_user")
+            and self.current_user is not None
+            and self.current_user.get("role") == "admin"
+        ):
             if user_valve_value is not None:
                 self.log(
                     f"'{valve_name or 'unknown'}' override allowed for admin user",
@@ -1324,7 +1323,7 @@ class Filter:
         # Query related memories
         try:
             results = await query_memory(
-                request=Request(scope={"type": "http", "app": webui_app}),
+                request=_build_webui_request(),
                 form_data=QueryMemoryForm(content=memory_query, k=effective_top_k),
                 user=user,
             )
@@ -1444,17 +1443,24 @@ class Filter:
             user: User model for ownership verification
 
         Returns:
-            Statistics dict: {"total": N, "deleted": M}
+            Statistics dict:
+            {
+                "total": N,
+                "vector_deleted": V,
+                "expiry_deleted": E,
+            }
         """
-        import time
-
         now_timestamp = int(time.time())
         expiry_table = MemoryExpiryTable()
 
         # Get expired records
         expired_records = expiry_table.get_expired(user.id, now_timestamp)
 
-        stats = {"total": len(expired_records), "deleted": 0}
+        stats = {
+            "total": len(expired_records),
+            "vector_deleted": 0,
+            "expiry_deleted": 0,
+        }
 
         if not expired_records:
             self.log("no expired memories found", level="debug")
@@ -1463,7 +1469,6 @@ class Filter:
         self.log(f"found {len(expired_records)} expired memories", level="info")
 
         for record in expired_records:
-            expiry_table_deleted = False
 
             try:
                 await asyncio.to_thread(
@@ -1471,6 +1476,7 @@ class Filter:
                     mem_id=str(record.mem_id),
                     user=user,
                 )
+                stats["vector_deleted"] += 1
                 self.log(
                     f"deleted memory from vector DB: {record.mem_id[:8]}...",
                     level="debug",
@@ -1485,7 +1491,7 @@ class Filter:
             # Always try to delete from expiry table, even if vector DB deletion failed
             try:
                 expiry_table.delete_by_mem_id(str(record.mem_id))
-                expiry_table_deleted = True
+                stats["expiry_deleted"] += 1
                 self.log(
                     f"deleted expiry record: {record.mem_id[:8]}...", level="debug"
                 )
@@ -1495,13 +1501,9 @@ class Filter:
                     level="error",
                 )
 
-            # Count as deleted if at least expiry table was cleaned up
-            # (vector DB deletion failure is acceptable if memory was already gone)
-            if expiry_table_deleted:
-                stats["deleted"] += 1
-
         self.log(
-            f"cleanup complete: deleted {stats['deleted']}/{stats['total']} expired memories",
+            f"cleanup complete: vector_deleted={stats['vector_deleted']}, "
+            f"expiry_deleted={stats['expiry_deleted']} (total candidates={stats['total']})",
             level="info",
         )
 
@@ -1529,8 +1531,6 @@ class Filter:
         Returns:
             Statistics dict: {"total": N, "boosted": M, "created": K}
         """
-        import time
-
         if not related_memories:
             return {"total": 0, "boosted": 0, "created": 0}
 
@@ -1637,9 +1637,13 @@ class Filter:
 
         # === Cleanup Expired Memories ===
         cleanup_stats = await self.cleanup_expired_memories(user)
-        if cleanup_stats["deleted"] > 0 and self.user_valves.show_status:
+        if (
+            cleanup_stats["expiry_deleted"] > 0 or cleanup_stats["vector_deleted"] > 0
+        ) and self.user_valves.show_status:
             await emit_status(
-                f"cleaned up {cleanup_stats['deleted']} expired memories",
+                "cleaned up expired memories: "
+                f"expiry_table={cleanup_stats['expiry_deleted']}, "
+                f"vector_db={cleanup_stats['vector_deleted']}",
                 emitter=emitter,
                 status="complete",
             )
@@ -1712,7 +1716,6 @@ class Filter:
         Execute memory actions from the plan.
         Order: delete -> update -> add (prevents conflicts)
         """
-        from open_webui.internal.db import get_db
 
         self.log("started apply_memory_actions", level="debug")
         actions = action_plan.actions
@@ -1728,64 +1731,56 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
-        # Group actions and define handlers
-        operations: dict[str, dict[str, Any]] = {
-            "delete": {
-                "actions": [a for a in actions if a.action == "delete"],
-                "handler": lambda a: self._delete_memory_with_db(a, user),
-                "log_msg": lambda a: f"deleted memory. id={a.id}",
-                "error_msg": lambda a, e: f"failed to delete memory {a.id}: {e}",
-                "skip_empty": lambda a: False,
-                "status_verb": "deleted",
-            },
-            "update": {
-                "actions": [a for a in actions if a.action == "update"],
-                "handler": lambda a: update_memory_by_id(
-                    memory_id=a.id,
-                    request=Request(scope={"type": "http", "app": webui_app}),
-                    form_data=MemoryUpdateModel(content=a.content),
-                    user=user,
-                ),
-                "log_msg": lambda a: f"updated memory. id={a.id}",
-                "error_msg": lambda a, e: f"failed to update memory {a.id}: {e}",
-                "skip_empty": lambda a: not a.content.strip(),
-                "status_verb": "updated",
-            },
-            "add": {
-                "actions": [a for a in actions if a.action == "add"],
-                "handler": lambda a: self._add_memory_with_expiry(a, user),
-                "log_msg": lambda a: f"added memory. content={a.content}",
-                "error_msg": lambda a, e: f"failed to add memory: {e}",
-                "skip_empty": lambda a: not a.content.strip(),
-                "status_verb": "saved",
-            },
+        action_groups = {
+            action_name: [a for a in actions if a.action == action_name]
+            for action_name in ACTION_ORDER
         }
+        counts: dict[str, int] = {action_name: 0 for action_name in ACTION_ORDER}
 
-        # Process all operations in order
-        counts = {}
-
-        for op_name, op_config in operations.items():
-            counts[op_name] = 0
-            for action in op_config["actions"]:
-                if op_config["skip_empty"](action):
-                    continue
+        for action_name in ACTION_ORDER:
+            for action in action_groups[action_name]:
                 try:
-                    await op_config["handler"](action)
-                    self.log(op_config["log_msg"](action))
-                    counts[op_name] += 1
-
+                    if action_name == "delete":
+                        delete_action = cast(MemoryDeleteAction, action)
+                        await self._delete_memory_with_db(delete_action, user)
+                        self.log(f"deleted memory. id={delete_action.id}")
+                    elif action_name == "update":
+                        update_action = cast(MemoryUpdateAction, action)
+                        if not update_action.content.strip():
+                            continue
+                        await update_memory_by_id(
+                            memory_id=update_action.id,
+                            request=_build_webui_request(),
+                            form_data=MemoryUpdateModel(content=update_action.content),
+                            user=user,
+                        )
+                        self.log(f"updated memory. id={update_action.id}")
+                    else:
+                        add_action = cast(MemoryAddAction, action)
+                        if not add_action.content.strip():
+                            continue
+                        await self._add_memory_with_expiry(add_action, user)
+                        self.log(f"added memory. content={add_action.content}")
+                    counts[action_name] += 1
                 except Exception as e:
+                    action_hint = (
+                        f"{action_name} memory"
+                        if action_name == "add"
+                        else f"{action_name} memory {cast(Any, action).id}"
+                    )
                     raise RuntimeError(
-                        f"memory action failed: {op_config['error_msg'](action, e)}"
+                        f"memory action failed: failed to {action_hint}: {e}"
                     )
 
-        # Build status message
         status_parts = []
-        for op_name, op_config in operations.items():
-            count = counts[op_name]
+        status_verbs = {"delete": "deleted", "update": "updated", "add": "saved"}
+        for action_name in ACTION_ORDER:
+            count = counts[action_name]
             if count > 0:
                 memory_word = "memory" if count == 1 else "memories"
-                status_parts.append(f"{op_config['status_verb']} {count} {memory_word}")
+                status_parts.append(
+                    f"{status_verbs[action_name]} {count} {memory_word}"
+                )
 
         status_message = ", ".join(status_parts)
         self.log(status_message or "no changes", level="info")
