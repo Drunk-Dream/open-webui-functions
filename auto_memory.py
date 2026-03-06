@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.5
+version: 1.4.6
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,6 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
+- Version 1.4.6: Improved error handling - skip invalid tool calls instead of failing all operations
 - Version 1.4.5: Unified field naming - changed update_memory field from 'new_content' to 'content' for consistency with add_memory
 - Version 1.4.3: Refactored code structure for readability and maintainability.
 - Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
@@ -945,41 +946,51 @@ class Filter:
                 tool_name = tool_call.function.name
                 if tool_name not in response_model:
                     expected = ", ".join(sorted(response_model.keys()))
-                    raise ValueError(
-                        f"unexpected tool name: {tool_name!r}; expected one of [{expected}]"
+                    self.log(
+                        f"skipping unexpected tool name: {tool_name!r}; expected one of [{expected}]",
+                        level="warning",
                     )
+                    continue
 
                 raw_args = tool_call.function.arguments
                 if not raw_args or not raw_args.strip():
-                    raise ValueError(
-                        f"tool call {tool_name!r} returned empty arguments"
+                    self.log(
+                        f"skipping tool call {tool_name!r} with empty arguments",
+                        level="warning",
                     )
+                    continue
 
                 self.log(
                     f"tool call {tool_name} arguments: {raw_args[:500]}", level="debug"
                 )
-                parsed_args = response_model[tool_name].model_validate_json(raw_args)
-                if tool_name == "add_memory":
-                    parsed_add = cast(MemoryAddToolRequest, parsed_args)
-                    actions.append(
-                        MemoryAddAction(action="add", content=parsed_add.content)
-                    )
-                elif tool_name == "update_memory":
-                    parsed_update = cast(MemoryUpdateToolRequest, parsed_args)
-                    actions.append(
-                        MemoryUpdateAction(
-                            action="update",
-                            id=parsed_update.id,
-                            content=parsed_update.content,
-                        )
-                    )
-                elif tool_name == "delete_memory":
-                    parsed_delete = cast(MemoryDeleteToolRequest, parsed_args)
-                    actions.append(
-                        MemoryDeleteAction(action="delete", id=parsed_delete.id)
-                    )
 
-            return MemoryActionRequestStub(actions=actions)
+                try:
+                    parsed_args = response_model[tool_name].model_validate_json(raw_args)
+                    if tool_name == "add_memory":
+                        parsed_add = cast(MemoryAddToolRequest, parsed_args)
+                        actions.append(
+                            MemoryAddAction(action="add", content=parsed_add.content)
+                        )
+                    elif tool_name == "update_memory":
+                        parsed_update = cast(MemoryUpdateToolRequest, parsed_args)
+                        actions.append(
+                            MemoryUpdateAction(
+                                action="update",
+                                id=parsed_update.id,
+                                content=parsed_update.content,
+                            )
+                        )
+                    elif tool_name == "delete_memory":
+                        parsed_delete = cast(MemoryDeleteToolRequest, parsed_args)
+                        actions.append(
+                            MemoryDeleteAction(action="delete", id=parsed_delete.id)
+                        )
+                except Exception as e:
+                    self.log(
+                        f"skipping tool call {tool_name!r} due to parameter validation error: {e}",
+                        level="warning",
+                    )
+                    continue
 
         model_cls = cast(Any, response_model)
         if len(tool_calls) > 1:
@@ -1725,9 +1736,11 @@ class Filter:
                         if action_name == "add"
                         else f"{action_name} memory {cast(Any, action).id}"
                     )
-                    raise RuntimeError(
-                        f"memory action failed: failed to {action_hint}: {e}"
+                    self.log(
+                        f"memory action failed: failed to {action_hint}: {e}",
+                        level="error",
                     )
+                    # Continue with next action instead of raising
 
         status_parts = []
         status_verbs = {"delete": "deleted", "update": "updated", "add": "saved"}
