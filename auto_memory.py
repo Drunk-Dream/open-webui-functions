@@ -46,7 +46,6 @@ from typing import (
     Callable,
     Literal,
     Optional,
-    Protocol,
     Type,
     TypeVar,
     Union,
@@ -630,39 +629,6 @@ def _ensure_table_exists():
 
 
 _ensure_table_exists()
-
-
-# --- Vector Database ---
-class MemoryRepository:
-    """Centralized vector database operations for memory management."""
-
-    def __init__(self, user_id: str):
-        self.collection_name = f"user-memory-{user_id}"
-
-    def get_all_memories(self):
-        """Fetch all memories from vector database."""
-        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-
-        return VECTOR_DB_CLIENT.get(collection_name=self.collection_name)
-
-    async def upsert_with_vectors(
-        self,
-        items: list[dict[str, object]],
-        user: object,
-        embedding_function: "EmbeddingCallable",
-    ) -> None:
-        """Upsert items with vector generation."""
-        from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-
-        for item in items:
-            vector = await embedding_function(str(item["text"]), user=user)
-            item["vector"] = vector
-
-        VECTOR_DB_CLIENT.upsert(collection_name=self.collection_name, items=items)
-
-
-class EmbeddingCallable(Protocol):
-    async def __call__(self, text: str, user: object) -> list[float]: ...
 
 
 R = TypeVar("R", bound=BaseModel)
@@ -1371,14 +1337,6 @@ class Filter:
     # ------------------------------------------------------------------------
     # Helper Methods
     # ------------------------------------------------------------------------
-    def _run_async_blocking(self, coro: Awaitable[Any]) -> Any:
-        """Run async coroutine synchronously (blocks until complete).
-
-        Deprecated: Use _run_async_in_thread instead.
-        Kept for backward compatibility.
-        """
-        return _run_async_in_thread(coro)
-
     def build_inlet_memory_context(self, memories: list[Memory]) -> str:
         memory_lines = []
         for idx, memory in enumerate(memories, start=1):
@@ -1469,7 +1427,6 @@ class Filter:
         self.log(f"found {len(expired_records)} expired memories", level="info")
 
         for record in expired_records:
-
             try:
                 await asyncio.to_thread(
                     self._delete_memory_sync,
@@ -1836,7 +1793,7 @@ class Filter:
         try:
             related_memories = cast(
                 list[Memory],
-                self._run_async_blocking(
+                _run_async_in_thread(
                     self.get_related_memories(
                         messages=messages,
                         user=user,

@@ -409,9 +409,8 @@ def test_inlet_injects_related_memories_into_messages(mock_emitter):
 
     with (
         patch("auto_memory.Users.get_user_by_id") as mock_get_user,
-        patch.object(
-            filter_instance,
-            "_run_async_blocking",
+        patch(
+            "auto_memory._run_async_in_thread",
             side_effect=lambda coro: (coro.close(), [memory])[1],
         ),
     ):
@@ -441,9 +440,8 @@ def test_inlet_injects_with_single_user_message(mock_emitter):
 
     with (
         patch("auto_memory.Users.get_user_by_id") as mock_get_user,
-        patch.object(
-            filter_instance,
-            "_run_async_blocking",
+        patch(
+            "auto_memory._run_async_in_thread",
             side_effect=lambda coro: (coro.close(), [memory])[1],
         ),
     ):
