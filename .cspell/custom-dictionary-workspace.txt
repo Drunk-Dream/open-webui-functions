@@ -1,0 +1,9 @@
+# Custom Dictionary Words
+checkfirst
+coro
+metadatas
+metas
+nokodo
+searchresults
+stringifying
+webui
