@@ -498,7 +498,7 @@ async def test_cleanup_expired_memories_returns_detailed_stats(mock_user):
     mock_record_2.mem_id = "mem-expired-002"
 
     with (
-        patch("auto_memory.MemoryExpiryTable") as mock_expiry_table_class,
+        patch("auto_memory.MemoryExpiries") as mock_expiry_table,
         patch.object(
             filter_instance,
             "_delete_memory_sync",
@@ -506,7 +506,6 @@ async def test_cleanup_expired_memories_returns_detailed_stats(mock_user):
         ),
         patch("time.time", return_value=2000),
     ):
-        mock_expiry_table = mock_expiry_table_class.return_value
         mock_expiry_table.get_expired.return_value = [mock_record_1, mock_record_2]
         mock_expiry_table.delete_by_mem_id.return_value = None
 

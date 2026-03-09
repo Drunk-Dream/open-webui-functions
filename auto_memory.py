@@ -1164,7 +1164,8 @@ class Filter:
                     f"'{valve_name or 'unknown'}' override authorized (user has own API key)",
                     level="debug",
                 )
-            return user_valve_value if user_valve_value is not None else admin_fallback
+                return user_valve_value
+            return admin_fallback
 
         # Allow admins to override without providing their own API key
         if (
@@ -1177,7 +1178,8 @@ class Filter:
                     f"'{valve_name or 'unknown'}' override allowed for admin user",
                     level="info",
                 )
-            return user_valve_value if user_valve_value is not None else admin_fallback
+                return user_valve_value
+            return admin_fallback
 
         if self.valves.allow_unsafe_user_overrides:
             if user_valve_value is not None:
@@ -1185,7 +1187,8 @@ class Filter:
                     f"'{valve_name or 'unknown'}' override allowed (unsafe overrides enabled)",
                     level="warning",
                 )
-            return user_valve_value if user_valve_value is not None else admin_fallback
+                return user_valve_value
+            return admin_fallback
 
         if user_valve_value is not None:
             self.log(
@@ -1426,7 +1429,7 @@ class Filter:
             }
         """
         now_timestamp = int(time.time())
-        expiry_table = MemoryExpiryTable()
+        expiry_table = MemoryExpiries
 
         # Get expired records
         expired_records = expiry_table.get_expired(user.id, now_timestamp)
@@ -1509,7 +1512,7 @@ class Filter:
             return {"total": 0, "boosted": 0, "created": 0}
 
         now_timestamp = int(time.time())
-        expiry_table = MemoryExpiryTable()
+        expiry_table = MemoryExpiries
 
         stats = {"total": len(related_memories), "boosted": 0, "created": 0}
 
