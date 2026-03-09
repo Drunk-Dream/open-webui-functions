@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.6
+version: 1.4.7
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,6 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
+- Version 1.4.7: Optimized emit_status messages for mobile display by shortening each status text and splitting long updates into multiple emits
 - Version 1.4.6: Improved error handling - skip invalid tool calls instead of failing all operations
 - Version 1.4.5: Unified field naming - changed update_memory field from 'new_content' to 'content' for consistency with add_memory
 - Version 1.4.3: Refactored code structure for readability and maintainability.
@@ -965,7 +966,9 @@ class Filter:
                 )
 
                 try:
-                    parsed_args = response_model[tool_name].model_validate_json(raw_args)
+                    parsed_args = response_model[tool_name].model_validate_json(
+                        raw_args
+                    )
                     if tool_name == "add_memory":
                         parsed_add = cast(MemoryAddToolRequest, parsed_args)
                         actions.append(
@@ -992,6 +995,9 @@ class Filter:
                     )
                     continue
 
+            return MemoryActionRequestStub(actions=actions)
+
+        # Single-model mode: expect exactly one tool call
         model_cls = cast(Any, response_model)
         if len(tool_calls) > 1:
             raise ValueError(
@@ -1597,24 +1603,36 @@ class Filter:
             if (
                 boost_stats["boosted"] > 0 or boost_stats["created"] > 0
             ) and self.user_valves.show_status:
-                await emit_status(
-                    f"boosted {boost_stats['boosted']} memories, created {boost_stats['created']} expiry records",
-                    emitter=emitter,
-                    status="complete",
-                )
+                if boost_stats["boosted"] > 0:
+                    await emit_status(
+                        f"boost {boost_stats['boosted']}",
+                        emitter=emitter,
+                        status="complete",
+                    )
+                if boost_stats["created"] > 0:
+                    await emit_status(
+                        f"exp+ {boost_stats['created']}",
+                        emitter=emitter,
+                        status="complete",
+                    )
 
         # === Cleanup Expired Memories ===
         cleanup_stats = await self.cleanup_expired_memories(user)
         if (
             cleanup_stats["expiry_deleted"] > 0 or cleanup_stats["vector_deleted"] > 0
         ) and self.user_valves.show_status:
-            await emit_status(
-                "cleaned up expired memories: "
-                f"expiry_table={cleanup_stats['expiry_deleted']}, "
-                f"vector_db={cleanup_stats['vector_deleted']}",
-                emitter=emitter,
-                status="complete",
-            )
+            if cleanup_stats["expiry_deleted"] > 0:
+                await emit_status(
+                    f"exp- {cleanup_stats['expiry_deleted']}",
+                    emitter=emitter,
+                    status="complete",
+                )
+            if cleanup_stats["vector_deleted"] > 0:
+                await emit_status(
+                    f"mem- {cleanup_stats['vector_deleted']}",
+                    emitter=emitter,
+                    status="complete",
+                )
 
         stringified_memories = json.dumps(
             [memory.model_dump(mode="json") for memory in related_memories]
@@ -1669,9 +1687,7 @@ class Filter:
         except Exception as e:
             self.log(f"memory planning failed: {e}", level="error")
             if self.user_valves.show_status:
-                await emit_status(
-                    "memory planning failed", emitter=emitter, status="error"
-                )
+                await emit_status("plan failed", emitter=emitter, status="error")
             return None
 
     async def apply_memory_actions(
@@ -1692,7 +1708,7 @@ class Filter:
         if emitter is not None and len(actions) > 0:
             self.log(f"processing {len(actions)} memory actions", level="debug")
             await emit_status(
-                f"processing {len(actions)} memory actions",
+                f"actions: {len(actions)}",
                 emitter=emitter,
                 status="in_progress",
             )
@@ -1743,14 +1759,11 @@ class Filter:
                     # Continue with next action instead of raising
 
         status_parts = []
-        status_verbs = {"delete": "deleted", "update": "updated", "add": "saved"}
+        status_labels = {"delete": "del", "update": "upd", "add": "add"}
         for action_name in ACTION_ORDER:
             count = counts[action_name]
             if count > 0:
-                memory_word = "memory" if count == 1 else "memories"
-                status_parts.append(
-                    f"{status_verbs[action_name]} {count} {memory_word}"
-                )
+                status_parts.append(f"{status_labels[action_name]} {count}")
 
         status_message = ", ".join(status_parts)
         self.log(status_message or "no changes", level="info")
