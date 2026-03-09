@@ -1608,13 +1608,13 @@ class Filter:
             ) and self.user_valves.show_status:
                 if boost_stats["boosted"] > 0:
                     await emit_status(
-                        f"boost {boost_stats['boosted']}",
+                        f"boost {boost_stats['boosted']} {'memory' if boost_stats['boosted'] == 1 else 'memories'}",
                         emitter=emitter,
                         status="complete",
                     )
                 if boost_stats["created"] > 0:
                     await emit_status(
-                        f"exp+ {boost_stats['created']}",
+                        f"exp+ {boost_stats['created']} {'memory' if boost_stats['created'] == 1 else 'memories'}",
                         emitter=emitter,
                         status="complete",
                     )
@@ -1626,13 +1626,13 @@ class Filter:
         ) and self.user_valves.show_status:
             if cleanup_stats["expiry_deleted"] > 0:
                 await emit_status(
-                    f"exp- {cleanup_stats['expiry_deleted']}",
+                    f"exp- {cleanup_stats['expiry_deleted']} {'memory' if cleanup_stats['expiry_deleted'] == 1 else 'memories'}",
                     emitter=emitter,
                     status="complete",
                 )
             if cleanup_stats["vector_deleted"] > 0:
                 await emit_status(
-                    f"mem- {cleanup_stats['vector_deleted']}",
+                    f"mem- {cleanup_stats['vector_deleted']} {'memory' if cleanup_stats['vector_deleted'] == 1 else 'memories'}",
                     emitter=emitter,
                     status="complete",
                 )
@@ -1690,7 +1690,9 @@ class Filter:
         except Exception as e:
             self.log(f"memory planning failed: {e}", level="error")
             if self.user_valves.show_status:
-                await emit_status("plan failed", emitter=emitter, status="error")
+                await emit_status(
+                    "processing memories failed", emitter=emitter, status="error"
+                )
             return None
 
     async def apply_memory_actions(
