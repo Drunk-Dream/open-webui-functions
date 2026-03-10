@@ -1601,38 +1601,35 @@ class Filter:
         related_memories = await self.get_related_memories(messages=messages, user=user)
 
         # === Boost Retrieved Memories (extend expiry) ===
+        boost_stats = {"boosted": 0, "created": 0}
         if related_memories:
             boost_stats = await self.boost_memories(related_memories, user)
-            if (
-                boost_stats["boosted"] > 0 or boost_stats["created"] > 0
-            ) and self.user_valves.show_status:
-                if boost_stats["boosted"] > 0:
-                    await emit_status(
-                        f"boost {boost_stats['boosted']} {'memory' if boost_stats['boosted'] == 1 else 'memories'}",
-                        emitter=emitter,
-                        status="complete",
-                    )
-                if boost_stats["created"] > 0:
-                    await emit_status(
-                        f"exp+ {boost_stats['created']} {'memory' if boost_stats['created'] == 1 else 'memories'}",
-                        emitter=emitter,
-                        status="complete",
-                    )
 
         # === Cleanup Expired Memories ===
         cleanup_stats = await self.cleanup_expired_memories(user)
-        if (
-            cleanup_stats["expiry_deleted"] > 0 or cleanup_stats["vector_deleted"] > 0
-        ) and self.user_valves.show_status:
+
+        if self.user_valves.show_status:
+            if boost_stats["boosted"] > 0:
+                await emit_status(
+                    f"延长{boost_stats['boosted']}个",
+                    emitter=emitter,
+                    status="complete",
+                )
+            if boost_stats["created"] > 0:
+                await emit_status(
+                    f"初始化{boost_stats['created']}个",
+                    emitter=emitter,
+                    status="complete",
+                )
             if cleanup_stats["expiry_deleted"] > 0:
                 await emit_status(
-                    f"exp- {cleanup_stats['expiry_deleted']} {'memory' if cleanup_stats['expiry_deleted'] == 1 else 'memories'}",
+                    f"清理过期{cleanup_stats['expiry_deleted']}个",
                     emitter=emitter,
                     status="complete",
                 )
             if cleanup_stats["vector_deleted"] > 0:
                 await emit_status(
-                    f"mem- {cleanup_stats['vector_deleted']} {'memory' if cleanup_stats['vector_deleted'] == 1 else 'memories'}",
+                    f"清理向量{cleanup_stats['vector_deleted']}个",
                     emitter=emitter,
                     status="complete",
                 )
@@ -1709,14 +1706,6 @@ class Filter:
         self.log("started apply_memory_actions", level="debug")
         actions = action_plan.actions
 
-        # Show processing status
-        if emitter is not None and len(actions) > 0:
-            self.log(f"processing {len(actions)} memory actions", level="debug")
-            await emit_status(
-                f"actions: {len(actions)}",
-                emitter=emitter,
-                status="in_progress",
-            )
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
@@ -1763,18 +1752,28 @@ class Filter:
                     )
                     # Continue with next action instead of raising
 
-        status_parts = []
-        status_labels = {"delete": "del", "update": "upd", "add": "add"}
-        for action_name in ACTION_ORDER:
-            count = counts[action_name]
-            if count > 0:
-                status_parts.append(f"{status_labels[action_name]} {count}")
+        status_labels = {"delete": "删除", "update": "更新", "add": "新增"}
+        has_actions = any(counts[action_name] > 0 for action_name in ACTION_ORDER)
 
-        status_message = ", ".join(status_parts)
-        self.log(status_message or "no changes", level="info")
+        if has_actions:
+            log_parts = []
+            for action_name in ACTION_ORDER:
+                count = counts[action_name]
+                if count > 0:
+                    log_parts.append(f"{status_labels[action_name]}{count}个")
+            self.log(", ".join(log_parts), level="info")
+        else:
+            self.log("no changes", level="info")
 
-        if status_message and self.user_valves.show_status:
-            await emit_status(status_message, emitter=emitter, status="complete")
+        if self.user_valves.show_status:
+            for action_name in ACTION_ORDER:
+                count = counts[action_name]
+                if count > 0:
+                    await emit_status(
+                        f"{status_labels[action_name]}{count}个",
+                        emitter=emitter,
+                        status="complete",
+                    )
 
     # ------------------------------------------------------------------------
     # Plugin Lifecycle Hooks
