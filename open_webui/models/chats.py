@@ -3,32 +3,32 @@ from __future__ import annotations
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
 
 
 class ChatListResponse(BaseModel):
-    chats: list[object] = Field(default_factory=list)
+    items: list[object] = Field(default_factory=list)
+    total: int = Field(default=0)
     model_config: ClassVar[ConfigDict] = ConfigDict(arbitrary_types_allowed=True)
 
 
-class Chats:
-    """Mock implementation for testing only.
+class ChatTable:
+    def get_chats_by_user_id(
+        self,
+        user_id: str,
+        filter: dict | None = None,
+        skip: int | None = None,
+        limit: int | None = None,
+        db: Session | None = None,
+    ) -> ChatListResponse:
+        _ = (filter, skip, limit, db)
+        return ChatListResponse(items=[], total=0)
 
-    This is a minimal mock of the real Chats model from open-webui.
-    Do not use in production - it does not perform actual database operations.
-    """
-
-    @staticmethod
-    def get_chats_by_user_id(user_id: str) -> ChatListResponse:
-        _ = user_id
-        return ChatListResponse(chats=[])
-
-    @staticmethod
     def delete_chat_by_id_and_user_id(
-        chat_id: str, user_id: str, db: object | None = None
+        self, id: str, user_id: str, db: Session | None = None
     ) -> bool:
-        """Mock delete operation - always returns True without actual deletion.
-
-        In production, this should perform actual database deletion.
-        """
-        _ = (chat_id, user_id, db)
+        _ = (id, user_id, db)
         return True
+
+
+Chats = ChatTable()

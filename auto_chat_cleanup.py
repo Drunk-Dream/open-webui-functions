@@ -289,7 +289,7 @@ class Filter:
             return body
 
         chats_response = Chats.get_chats_by_user_id(user.id)
-        chats = chats_response.chats
+        chats = chats_response.items
 
         _ = await self._cleanup_chats(
             chats=chats,
