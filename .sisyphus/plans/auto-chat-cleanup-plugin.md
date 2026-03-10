@@ -98,7 +98,7 @@ Wave 2: 任务 4-6（状态提示与失败处理、验证收敛、收尾）
 > Implementation + Test = ONE task. Never separate.
 > EVERY task MUST have: Agent Profile + Parallelization + QA Scenarios.
 
-- [ ] 1. 创建测试骨架并锁定行为语义
+- [x] 1. 创建测试骨架并锁定行为语义
 
   **What to do**: 新建 `tests/test_auto_chat_cleanup.py`，先写失败测试来锁定插件行为：仅 `outlet` 触发、仅当前用户范围、受保护对话永不删除、当前活跃对话永不删除、年龄/数量规则为 OR、`updated_at` 异常时跳过、无候选时不删除。沿用 `tests/conftest.py` 与 `tests/test_auto_memory_function_calling.py` 的 fixture/patch 风格。
   **Must NOT do**: 不接真实数据库，不碰 `open-webui/` 子模块，不先写插件后补测试。
@@ -138,7 +138,7 @@ Wave 2: 任务 4-6（状态提示与失败处理、验证收敛、收尾）
 
   **Commit**: YES | Message: `test(auto-chat-cleanup): lock cleanup selection semantics` | Files: `tests/test_auto_chat_cleanup.py`
 
-- [ ] 2. 实现配置模型与候删筛选逻辑
+- [x] 2. 实现配置模型与候删筛选逻辑
 
   **What to do**: 在 `auto_chat_cleanup.py` 中实现 `Filter`、`Valves`、`UserValves`、`log()` 以及纯筛选逻辑。配置至少包含：`enabled`、`show_status`、`max_idle_days`、`max_retained_chats`、`skip_folder_chats`、`skip_archived_chats`、`skip_pinned_chats`、`debug_mode`、可选 `min_cleanup_interval_seconds`。禁用语义固定为 `None` 或 `0` 表示该规则关闭。筛选顺序固定为：当前用户 chats → `updated_at desc` + `id` 升序稳定次排序 → 排除当前活跃对话 → 排除受保护对话 → 年龄候选 → 数量候选 → 并集去重。
   **Must NOT do**: 不直接删除任何 chat，不在此任务里实现 `outlet` 删除流程，不引入额外保护规则。
@@ -177,7 +177,7 @@ Wave 2: 任务 4-6（状态提示与失败处理、验证收敛、收尾）
 
   **Commit**: YES | Message: `feat(auto-chat-cleanup): add selection and config logic` | Files: `auto_chat_cleanup.py`, `tests/test_auto_chat_cleanup.py`
 
-- [ ] 3. 实现 outlet 删除流程与系统接口集成
+- [x] 3. 实现 outlet 删除流程与系统接口集成
 
   **What to do**: 在 `async outlet(...)` 中实现当前用户上下文解析、当前 chat id 识别、可选冷却时间短路、查询当前用户 chats、调用筛选逻辑、逐条调用 `Chats.delete_chat_by_id_and_user_id(id, user.id, db=db)` 删除。删除失败时只记录并继续，不中断整个 `outlet`；插件必须返回原始 `body`。
   **Must NOT do**: 不通过 HTTP 调路由，不 direct SQL delete，不删除其他用户对话，不删除当前活跃对话。
@@ -221,7 +221,7 @@ PY
 
   **Commit**: YES | Message: `feat(auto-chat-cleanup): add outlet-based chat cleanup plugin` | Files: `auto_chat_cleanup.py`, `tests/test_auto_chat_cleanup.py`
 
-- [ ] 4. 实现状态提示、日志与失败处理
+- [x] 4. 实现状态提示、日志与失败处理
 
   **What to do**: 参考 `auto_memory.py` 的 `emit_status()` 与 `show_status` 模式，实现删除数量提示：仅当删除数量 `> 0` 且 `show_status` 启用时，向 `__event_emitter__` 发出一次完成状态，例如“删除3个对话”；无删除时不提示。日志层级固定为：`info` 记录开始/结束与汇总，`debug` 记录逐条跳过理由，`warning` 记录 `updated_at` 异常与 delete 返回 False，`error` 记录 delete 抛异常。
   **Must NOT do**: 不在无删除时发出噪音提示，不向会话正文插入消息，不做阻塞性重试。
@@ -260,7 +260,7 @@ PY
 
   **Commit**: YES | Message: `test(auto-chat-cleanup): cover failure handling and status emission` | Files: `auto_chat_cleanup.py`, `tests/test_auto_chat_cleanup.py`
 
-- [ ] 5. 完成聚焦验证与根测试验证
+- [x] 5. 完成聚焦验证与根测试验证
 
   **What to do**: 运行语法检查、聚焦测试、根测试，并在失败时只修复与当前插件直接相关的问题。验证命令顺序固定为：`py_compile` → `tests/test_auto_chat_cleanup.py` → 根测试 `uv run pytest -q --ignore=open-webui`。
   **Must NOT do**: 不顺手修 unrelated 测试，不跑子模块测试，不扩展功能范围。
@@ -298,7 +298,7 @@ PY
 
   **Commit**: NO | Message: `n/a` | Files: `auto_chat_cleanup.py`, `tests/test_auto_chat_cleanup.py`
 
-- [ ] 6. 收尾、文档对齐与交付边界确认
+- [x] 6. 收尾、文档对齐与交付边界确认
 
   **What to do**: 确认只改动 `auto_chat_cleanup.py`、`tests/test_auto_chat_cleanup.py` 和必要的 `.sisyphus/evidence/`；回顾计划约束是否全部满足；准备最终交付说明，列出验证命令与结果。若需要提交，则遵循前述 commit strategy；若未被要求提交，则保持未提交状态。
   **Must NOT do**: 不改动 `open-webui/` 子模块，不顺手修改无关计划文件，不创建额外文档页。

@@ -1,0 +1,5 @@
+Task 1 verification
+py_compile: exit 0
+pytest collection: 9 skipped (plugin not yet implemented - expected)
+File: tests/test_auto_chat_cleanup.py (287 lines)
+Tests: age_rule, count_rule, or_semantics, protected_folder, protected_archived, protected_pinned, active_chat, no_candidates, invalid_updated_at

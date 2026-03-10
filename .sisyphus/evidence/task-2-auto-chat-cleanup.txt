@@ -1,0 +1,5 @@
+Task 2 verification
+py_compile: exit 0
+pytest selection tests: 7 passed
+File: auto_chat_cleanup.py (153 lines)
+Components: Filter, Valves, UserValves, log(), _select_candidates()

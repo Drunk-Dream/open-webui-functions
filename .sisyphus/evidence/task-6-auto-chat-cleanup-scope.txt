@@ -1,0 +1,19 @@
+Scenario: Verify no submodule edits
+====================================
+
+Command:
+--------
+uv run python - <<'PY'
+import subprocess
+out = subprocess.check_output(['git', 'status', '--short'], text=True)
+assert ' open-webui/' not in out
+print('ok')
+PY
+
+Result:
+-------
+ok
+
+Conclusion:
+-----------
+✓ 未改动 open-webui/ 子模块

@@ -1,0 +1,6 @@
+# Task 3 - auto_chat_cleanup outlet
+
+## Verification
+- lsp_diagnostics: clean for `auto_chat_cleanup.py`, `open_webui/models/chats.py`, `open_webui/models/users.py`
+- `uv run python -m py_compile auto_chat_cleanup.py` → exit 0
+- `uv run pytest -q --ignore=open-webui tests/test_auto_chat_cleanup.py` → 9 passed

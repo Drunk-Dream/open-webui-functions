@@ -1,0 +1,137 @@
+Task 6: 收尾、文档对齐与交付边界确认
+========================================
+
+## 改动范围检查
+
+### git status --short
+```
+M  .gitignore
+ M .sisyphus/boulder.json
+AM .sisyphus/plans/auto-chat-cleanup-plugin.md
+M  .sisyphus/plans/auto-memory-function-calling-refactor.md
+ M open_webui/models/users.py
+?? .sisyphus/evidence/
+?? .sisyphus/notepads/auto-chat-cleanup-plugin/
+?? auto_chat_cleanup.py
+?? open_webui/models/chats.py
+?? tests/test_auto_chat_cleanup.py
+```
+
+### 改动分类
+
+**预期改动（核心交付物）：**
+- `auto_chat_cleanup.py` — 新插件文件
+- `tests/test_auto_chat_cleanup.py` — 新测试文件
+- `.sisyphus/evidence/` — 验证证据目录
+- `.sisyphus/notepads/auto-chat-cleanup-plugin/` — 学习记录目录
+
+**允许改动（本地 mock 依赖）：**
+- `open_webui/models/users.py` — 本地 mock 文件（非子模块）
+- `open_webui/models/chats.py` — 新增本地 mock 文件（非子模块）
+
+**系统改动（构建/计划管理）：**
+- `.sisyphus/boulder.json` — 系统状态文件
+- `.sisyphus/plans/auto-chat-cleanup-plugin.md` — 本计划文件（新增）
+- `.gitignore` — 新增 `/database_structure.txt` 忽略规则
+
+**非预期改动（其他计划状态）：**
+- `.sisyphus/plans/auto-memory-function-calling-refactor.md` — 另一个计划的状态更新（已暂存）
+
+### 子模块边界验证
+```
+uv run python - <<'PY'
+import subprocess
+out = subprocess.check_output(['git', 'status', '--short'], text=True)
+assert ' open-webui/' not in out
+print('ok')
+PY
+```
+**结果：** ok — 未改动 `open-webui/` 子模块
+
+## 计划约束回顾
+
+### Definition of Done 验证
+
+1. **语法检查：** `uv run python -m py_compile auto_chat_cleanup.py tests/test_auto_chat_cleanup.py`
+   - 退出码：0 ✓
+
+2. **聚焦测试：** `uv run pytest -q --ignore=open-webui tests/test_auto_chat_cleanup.py`
+   - 结果：9 passed in 0.24s ✓
+
+3. **根测试：** `uv run pytest -q --ignore=open-webui`
+   - 结果：22 passed in 0.73s ✓
+
+4. **删除接口：** 插件调用 `Chats.delete_chat_by_id_and_user_id(...)`
+   - 验证：已通过 Task 3 的 safety check ✓
+
+5. **outlet 触发：** 插件仅在 `outlet` 执行
+   - 验证：已通过 Task 3 的集成测试 ✓
+
+6. **状态提示：** 删除数量 > 0 时通过 `emit_status()` 提示
+   - 验证：已通过 Task 4 的状态发射测试 ✓
+
+### Must Have 验证
+
+- 根目录单文件 Filter 插件实现 ✓
+- `outlet` 自动触发实现 ✓
+- 当前用户作用域实现 ✓
+- 基于 `updated_at` 的闲置时长规则实现 ✓
+- 基于 `updated_at desc` 的最大保留数量规则实现 ✓
+- 受保护对话过滤实现 ✓
+- 调用系统默认删除接口的实现 ✓
+- `emit_status()` 风格的删除数量提示实现 ✓
+- pytest 自动化验证实现 ✓
+
+### Must NOT Have 验证
+
+- 未设计定时任务、后台调度器 ✓
+- 未设计前端配置页面 ✓
+- 未设计管理员全局清理 ✓
+- 未直接写 SQL 删除 ✓
+- 未修改 `open-webui/` 子模块源码 ✓
+- 未引入标签、标题模糊匹配等扩展规则 ✓
+- 未把受保护对话计入保留数量窗口 ✓
+
+## 最终交付说明
+
+### 核心交付物
+
+1. **auto_chat_cleanup.py**
+   - Filter 插件实现
+   - Valves / UserValves 配置模型
+   - 候删筛选逻辑（年龄规则 OR 数量规则）
+   - outlet 删除流程
+   - 状态提示与日志实现
+
+2. **tests/test_auto_chat_cleanup.py**
+   - 9 个测试用例覆盖核心行为
+   - 年龄规则、数量规则、保护规则测试
+   - 活跃对话保护、无候选 no-op 测试
+   - 状态提示、失败处理测试
+
+### 验证结果汇总
+
+| 验证项 | 命令 | 结果 |
+|--------|------|------|
+| 语法检查 | `uv run python -m py_compile auto_chat_cleanup.py tests/test_auto_chat_cleanup.py` | 通过 |
+| 聚焦测试 | `uv run pytest -q --ignore=open-webui tests/test_auto_chat_cleanup.py` | 9 passed |
+| 根测试 | `uv run pytest -q --ignore=open-webui` | 22 passed |
+| 子模块边界 | `git status --short` + 断言 | 未改动 |
+
+### 改动范围确认
+
+- 核心文件：`auto_chat_cleanup.py`、`tests/test_auto_chat_cleanup.py`
+- 本地 mock：`open_webui/models/users.py`、`open_webui/models/chats.py`
+- 证据/笔记：`.sisyphus/evidence/`、`.sisyphus/notepads/auto-chat-cleanup-plugin/`
+- 系统文件：`.sisyphus/boulder.json`、`.sisyphus/plans/auto-chat-cleanup-plugin.md`、`.gitignore`
+
+### 提交状态
+
+按计划要求，Task 6 不创建 git commit。当前状态：
+- 核心文件未提交（untracked）
+- 计划文件已暂存（staged）
+- 等待用户明确提交指令
+
+## 结论
+
+所有计划约束已满足，核心交付物已完成并通过验证。改动范围符合预期，未触及 `open-webui/` 子模块。

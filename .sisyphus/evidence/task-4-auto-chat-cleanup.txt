@@ -1,0 +1,11 @@
+任务: 实现状态提示、日志与失败处理
+
+变更摘要:
+- 在 `auto_chat_cleanup.py` 添加了与 `auto_memory.py` 对齐的 `emit_status()`。
+- 在 `_cleanup_chats()` 中统计实际删除成功数量，仅在 `show_status=True` 且删除数大于 0 时发送 `已删除 {count} 个对话` 状态。
+- 调整日志层级: 开始/结束汇总为 info，逐条跳过理由为 debug，`updated_at` 异常与 delete 返回 False 为 warning，delete 抛异常为 error。
+
+验证结果:
+- `uv run python -m py_compile auto_chat_cleanup.py` → 退出码 0
+- `uv run pytest -q --ignore=open-webui tests/test_auto_chat_cleanup.py` → 9 passed in 0.25s
+- `lsp_diagnostics auto_chat_cleanup.py` → clean
