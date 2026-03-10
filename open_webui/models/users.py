@@ -1,13 +1,13 @@
 """Minimal Open WebUI models.users module."""
 
-from typing import Any, Optional
+from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
 
 class UserSettings(BaseModel):
-    ui: Optional[dict] = {}
-    model_config = ConfigDict(extra="allow")
+    ui: dict[str, object] | None = {}
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
 
 
 class UserModel(BaseModel):
@@ -17,14 +17,14 @@ class UserModel(BaseModel):
     name: str
     email: str
     role: str = "user"
-    settings: Optional[UserSettings] = None
+    settings: UserSettings | None = None
 
 
 class Users:
     """Users class for user operations."""
 
     @staticmethod
-    def get_user_by_id(user_id: str) -> UserModel:
+    def get_user_by_id(user_id: str) -> UserModel | None:
         """Get user by ID."""
         return UserModel(
             id=user_id,

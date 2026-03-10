@@ -77,7 +77,7 @@ Wave 3: Tests + smoke verification
 
 ## TODOs
 
-- [ ] 1. Design tool-calling contract for memory actions
+- [x] 1. Design tool-calling contract for memory actions
 
   **What to do**:
   - Make the action/request models strict about extra keys:
@@ -117,9 +117,9 @@ Wave 3: Tests + smoke verification
   - External docs: https://platform.openai.com/docs/guides/function-calling
 
   **Acceptance Criteria**:
-  - [ ] Tool schema (from Pydantic JSON Schema) sets `additionalProperties: false` (via `extra="forbid"`) and includes required fields.
-  - [ ] Update/delete `id` validation rejects unknown IDs before any mutation.
-  - [ ] Extra keys in tool args are rejected (not silently ignored).
+  - [x] Tool schema (from Pydantic JSON Schema) sets `additionalProperties: false` (via `extra="forbid"`) and includes required fields.
+  - [x] Update/delete `id` validation rejects unknown IDs before any mutation.
+  - [x] Extra keys in tool args are rejected (not silently ignored).
 
   **QA Scenarios**:
   ```
@@ -139,7 +139,7 @@ Wave 3: Tests + smoke verification
   **Commit**: NO (unless user explicitly requests) | Message: `refactor(auto-memory): define tool schema for memory action plan` | Files: `auto_memory.py`
 
 
-- [ ] 2. Rewrite the memory prompt for tool-calling plan generation
+- [x] 2. Rewrite the memory prompt for tool-calling plan generation
 
   **What to do**:
   - Replace/augment `UNIFIED_SYSTEM_PROMPT` usage (`auto_memory.py:65`, `auto_memory.py:1623`) for the action-planning step.
@@ -175,8 +175,8 @@ Wave 3: Tests + smoke verification
   - External docs: https://platform.openai.com/docs/guides/function-calling
 
   **Acceptance Criteria**:
-  - [ ] Prompt explicitly forces a tool call and allows `actions: []`.
-  - [ ] Prompt uses “latest user message” wording (no numeric index references like “-2”).
+  - [x] Prompt explicitly forces a tool call and allows `actions: []`.
+  - [x] Prompt uses “latest user message” wording (no numeric index references like “-2”).
 
   **QA Scenarios**:
   ```
@@ -196,7 +196,7 @@ Wave 3: Tests + smoke verification
   **Commit**: NO (unless user explicitly requests) | Message: `refactor(auto-memory): update prompt for tool-calling memory plan` | Files: `auto_memory.py`
 
 
-- [ ] 3. Implement tool-calling action-plan generation (no fallback)
+- [x] 3. Implement tool-calling action-plan generation (no fallback)
 
   **What to do**:
   - Add a dedicated method (or extend `query_openai_sdk`) to request a tool call using `client.chat.completions.create` (current client is `OpenAI(...)` in `auto_memory.py:941`).
@@ -234,8 +234,8 @@ Wave 3: Tests + smoke verification
   - External docs: https://platform.openai.com/docs/guides/function-calling
 
   **Acceptance Criteria**:
-  - [ ] When provider returns a valid tool call, a validated `actions` list is produced.
-  - [ ] When provider does not support tools, the plugin emits an error and applies zero actions.
+  - [x] When provider returns a valid tool call, a validated `actions` list is produced.
+  - [x] When provider does not support tools, the plugin emits an error and applies zero actions.
 
   **QA Scenarios**:
   ```
@@ -255,7 +255,7 @@ Wave 3: Tests + smoke verification
   **Commit**: NO (unless user explicitly requests) | Message: `refactor(auto-memory): generate memory action plan via tool calling` | Files: `auto_memory.py`
 
 
-- [ ] 4. Wire tool-calling plan into `auto_memory()` and preserve existing lifecycle
+- [x] 4. Wire tool-calling plan into `auto_memory()` and preserve existing lifecycle
 
   **What to do**:
   - In `auto_memory.py:1580`, keep current sequence:
@@ -283,9 +283,9 @@ Wave 3: Tests + smoke verification
   - Outlet trigger: `auto_memory.py:1771`
 
   **Acceptance Criteria**:
-  - [ ] On valid tool plan, actions are applied in the same order as before.
-  - [ ] On invalid tool plan, no memory router methods are called.
-  - [ ] When `actions: []`, do NOT call `apply_memory_actions`; log “no changes” and return.
+  - [x] On valid tool plan, actions are applied in the same order as before.
+  - [x] On invalid tool plan, no memory router methods are called.
+  - [x] When `actions: []`, do NOT call `apply_memory_actions`; log “no changes” and return.
 
   **QA Scenarios**:
   ```
@@ -305,7 +305,7 @@ Wave 3: Tests + smoke verification
   **Commit**: NO (unless user explicitly requests) | Message: `refactor(auto-memory): integrate tool plan into auto_memory flow` | Files: `auto_memory.py`
 
 
-- [ ] 5. Add unit tests for tool-calling planner and mutation guardrails
+- [x] 5. Add unit tests for tool-calling planner and mutation guardrails
 
   **What to do**:
   - Create a root-level pytest suite (none exists today): `tests/test_auto_memory_function_calling.py`.
@@ -332,7 +332,7 @@ Wave 3: Tests + smoke verification
   - apply order: `auto_memory.py:1646`
 
   **Acceptance Criteria**:
-  - [ ] `uv run pytest -q` passes.
+  - [x] `uv run pytest -q` passes.
 
   **QA Scenarios**:
   ```
@@ -352,7 +352,7 @@ Wave 3: Tests + smoke verification
   **Commit**: NO (unless user explicitly requests) | Message: `test(auto-memory): cover tool-calling memory action planning` | Files: `tests/test_auto_memory_function_calling.py`
 
 
-- [ ] 6. Verification sweep + reuse check against upstream Open WebUI memory tooling
+- [x] 6. Verification sweep + reuse check against upstream Open WebUI memory tooling
 
   **What to do**:
   - Verify compilation and tests:
@@ -378,8 +378,8 @@ Wave 3: Tests + smoke verification
   - Upstream tool registry: `open-webui/backend/open_webui/utils/tools.py:415`
 
   **Acceptance Criteria**:
-  - [ ] `uv run python -m py_compile auto_memory.py` succeeds.
-  - [ ] `uv run pytest -q` succeeds.
+  - [x] `uv run python -m py_compile auto_memory.py` succeeds.
+  - [x] `uv run pytest -q` succeeds.
 
   **QA Scenarios**:
   ```
@@ -400,10 +400,10 @@ Wave 3: Tests + smoke verification
 
 
 ## Final Verification Wave (4 parallel agents, ALL must APPROVE)
-- [ ] F1. Plan Compliance Audit — oracle
-- [ ] F2. Code Quality Review — unspecified-high
-- [ ] F3. Real Manual QA (simulated) — unspecified-high
-- [ ] F4. Scope Fidelity Check — deep
+- [x] F1. Plan Compliance Audit — oracle
+- [x] F2. Code Quality Review — unspecified-high
+- [x] F3. Real Manual QA (simulated) — unspecified-high
+- [x] F4. Scope Fidelity Check — deep
 
 ## Commit Strategy
 - Default: do not create commits (unless user explicitly requests).
