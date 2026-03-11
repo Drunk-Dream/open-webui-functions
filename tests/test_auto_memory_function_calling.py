@@ -487,7 +487,7 @@ def test_inject_memory_context_replaces_previous_memory_block():
 
 @pytest.mark.asyncio
 async def test_cleanup_expired_memories_returns_detailed_stats(mock_user):
-    """Test that cleanup_expired_memories returns detailed statistics with vector_deleted and expiry_deleted."""
+    """Test that cleanup_expired_memories returns count of deleted memories."""
     filter_instance = Filter()
     filter_instance.valves.debug_mode = False
 
@@ -509,15 +509,10 @@ async def test_cleanup_expired_memories_returns_detailed_stats(mock_user):
         mock_expiry_table.get_expired.return_value = [mock_record_1, mock_record_2]
         mock_expiry_table.delete_by_mem_id.return_value = None
 
-        stats = await filter_instance.cleanup_expired_memories(user=mock_user)
+        deleted_count = await filter_instance.cleanup_expired_memories(user=mock_user)
 
-    # Assert detailed statistics structure
-    assert "total" in stats
-    assert "vector_deleted" in stats
-    assert "expiry_deleted" in stats
-    assert stats["total"] == 2
-    assert stats["vector_deleted"] == 1  # First succeeded, second failed
-    assert stats["expiry_deleted"] == 2  # Both expiry records deleted
+    # Assert returns count of deleted memories
+    assert deleted_count == 2  # Both expiry records deleted
 
 
 def test_run_coro_in_new_loop_executes_coroutine():

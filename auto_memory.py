@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.7
+version: 1.4.8
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,6 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
+- Version 1.4.8: Simplified cleanup statistics logic and improved status message clarity by adding context suffix
 - Version 1.4.7: Optimized emit_status messages for mobile display by shortening each status text and splitting long updates into multiple emits
 - Version 1.4.6: Improved error handling - skip invalid tool calls instead of failing all operations
 - Version 1.4.5: Unified field naming - changed update_memory field from 'new_content' to 'content' for consistency with add_memory
@@ -1409,7 +1410,7 @@ class Filter:
     async def cleanup_expired_memories(
         self,
         user: UserModel,
-    ) -> dict[str, int]:
+    ) -> int:
         """
         Delete expired memories from both vector database and expiry table.
 
@@ -1421,12 +1422,7 @@ class Filter:
             user: User model for ownership verification
 
         Returns:
-            Statistics dict:
-            {
-                "total": N,
-                "vector_deleted": V,
-                "expiry_deleted": E,
-            }
+            Number of memories cleaned up
         """
         now_timestamp = int(time.time())
         expiry_table = MemoryExpiries
@@ -1434,18 +1430,13 @@ class Filter:
         # Get expired records
         expired_records = expiry_table.get_expired(user.id, now_timestamp)
 
-        stats = {
-            "total": len(expired_records),
-            "vector_deleted": 0,
-            "expiry_deleted": 0,
-        }
-
         if not expired_records:
             self.log("no expired memories found", level="debug")
-            return stats
+            return 0
 
         self.log(f"found {len(expired_records)} expired memories", level="info")
 
+        deleted_count = 0
         for record in expired_records:
             try:
                 await asyncio.to_thread(
@@ -1453,7 +1444,6 @@ class Filter:
                     mem_id=str(record.mem_id),
                     user=user,
                 )
-                stats["vector_deleted"] += 1
                 self.log(
                     f"deleted memory from vector DB: {record.mem_id[:8]}...",
                     level="debug",
@@ -1468,7 +1458,7 @@ class Filter:
             # Always try to delete from expiry table, even if vector DB deletion failed
             try:
                 expiry_table.delete_by_mem_id(str(record.mem_id))
-                stats["expiry_deleted"] += 1
+                deleted_count += 1
                 self.log(
                     f"deleted expiry record: {record.mem_id[:8]}...", level="debug"
                 )
@@ -1479,12 +1469,11 @@ class Filter:
                 )
 
         self.log(
-            f"cleanup complete: vector_deleted={stats['vector_deleted']}, "
-            f"expiry_deleted={stats['expiry_deleted']} (total candidates={stats['total']})",
+            f"cleanup complete: deleted {deleted_count} memories",
             level="info",
         )
 
-        return stats
+        return deleted_count
 
     async def boost_memories(
         self,
@@ -1606,30 +1595,24 @@ class Filter:
             boost_stats = await self.boost_memories(related_memories, user)
 
         # === Cleanup Expired Memories ===
-        cleanup_stats = await self.cleanup_expired_memories(user)
+        deleted_count = await self.cleanup_expired_memories(user)
 
         if self.user_valves.show_status:
             if boost_stats["boosted"] > 0:
                 await emit_status(
-                    f"延长{boost_stats['boosted']}个",
+                    f"延长{boost_stats['boosted']}个记忆",
                     emitter=emitter,
                     status="complete",
                 )
             if boost_stats["created"] > 0:
                 await emit_status(
-                    f"初始化{boost_stats['created']}个",
+                    f"初始化{boost_stats['created']}个记忆",
                     emitter=emitter,
                     status="complete",
                 )
-            if cleanup_stats["expiry_deleted"] > 0:
+            if deleted_count > 0:
                 await emit_status(
-                    f"清理过期{cleanup_stats['expiry_deleted']}个",
-                    emitter=emitter,
-                    status="complete",
-                )
-            if cleanup_stats["vector_deleted"] > 0:
-                await emit_status(
-                    f"清理向量{cleanup_stats['vector_deleted']}个",
+                    f"清理{deleted_count}个记忆",
                     emitter=emitter,
                     status="complete",
                 )
@@ -1760,7 +1743,7 @@ class Filter:
             for action_name in ACTION_ORDER:
                 count = counts[action_name]
                 if count > 0:
-                    log_parts.append(f"{status_labels[action_name]}{count}个")
+                    log_parts.append(f"{status_labels[action_name]}{count}个记忆")
             self.log(", ".join(log_parts), level="info")
         else:
             self.log("no changes", level="info")
@@ -1770,7 +1753,7 @@ class Filter:
                 count = counts[action_name]
                 if count > 0:
                     await emit_status(
-                        f"{status_labels[action_name]}{count}个",
+                        f"{status_labels[action_name]}{count}个记忆",
                         emitter=emitter,
                         status="complete",
                     )
