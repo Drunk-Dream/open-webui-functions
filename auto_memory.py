@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.8
+version: 1.4.9
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,7 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
-- Version 1.4.8: Simplified cleanup statistics logic and improved status message clarity by adding context suffix
+- Version 1.4.9: Completed behavior-preserving single-file refactor, restored import-time lifecycle column bootstrap, and aligned hard-cap compatibility in boost semantics
 - Version 1.4.7: Optimized emit_status messages for mobile display by shortening each status text and splitting long updates into multiple emits
 - Version 1.4.6: Improved error handling - skip invalid tool calls instead of failing all operations
 - Version 1.4.5: Unified field naming - changed update_memory field from 'new_content' to 'content' for consistency with add_memory
@@ -59,7 +59,7 @@ from typing import (
 from fastapi import HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
-from sqlalchemy import BigInteger, Column, Index, String
+from sqlalchemy import BigInteger, Column, Index, String, inspect, text
 from sqlalchemy.orm import Session
 
 from open_webui.internal.db import Base, engine, get_db_context
@@ -354,6 +354,9 @@ class Memory(BaseModel):
 
 
 # --- Model Utilities ---
+MemoryActionType = Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]
+
+
 def build_memory_action_tools(
     existing_ids: list[str],
 ) -> tuple[dict[str, Type[BaseModel]], list[dict[str, Any]], Literal["auto"]]:
@@ -392,6 +395,81 @@ def build_memory_action_tools(
     ]
 
     return tool_models, tool_definitions, "auto"
+
+
+def _resolve_chat_completion_settings(model_name: str) -> tuple[float, dict[str, Any]]:
+    if "gpt-5" in model_name:
+        return 1.0, {"reasoning_effort": "medium"}
+    if "gemini-3" in model_name:
+        return 1.0, {}
+    return 0.3, {}
+
+
+def _build_chat_completion_request_args(
+    model_name: str,
+    system_prompt: str,
+    user_message: str,
+    temperature: float,
+    extra_args: dict[str, Any],
+    tools: Optional[list[dict[str, Any]]] = None,
+    tool_choice: Optional[Union[dict[str, Any], str]] = None,
+) -> dict[str, Any]:
+    request_args: dict[str, Any] = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": temperature,
+        **extra_args,
+    }
+    if tools is not None:
+        request_args["tools"] = cast(Any, tools)
+    if tool_choice is not None:
+        request_args["tool_choice"] = cast(Any, tool_choice)
+    return request_args
+
+
+def _describe_tool_calling_response_model(
+    response_model: type[BaseModel] | dict[str, Type[BaseModel]],
+) -> str:
+    if isinstance(response_model, dict):
+        return f"tool-map[{', '.join(sorted(response_model.keys()))}]"
+    return cast(Any, response_model).__name__
+
+
+def _require_tool_call_arguments(raw_args: Optional[str]) -> str:
+    if not raw_args or not raw_args.strip():
+        raise ValueError("tool call returned empty arguments")
+    return raw_args
+
+
+def _build_memory_action_from_parsed_args(
+    tool_name: str, parsed_args: BaseModel
+) -> MemoryActionType:
+    if tool_name == "add_memory":
+        parsed_add = cast(MemoryAddToolRequest, parsed_args)
+        return MemoryAddAction(action="add", content=parsed_add.content)
+    if tool_name == "update_memory":
+        parsed_update = cast(MemoryUpdateToolRequest, parsed_args)
+        return MemoryUpdateAction(
+            action="update",
+            id=parsed_update.id,
+            content=parsed_update.content,
+        )
+    if tool_name == "delete_memory":
+        parsed_delete = cast(MemoryDeleteToolRequest, parsed_args)
+        return MemoryDeleteAction(action="delete", id=parsed_delete.id)
+    raise ValueError(f"unsupported tool name: {tool_name!r}")
+
+
+def _parse_memory_action_tool_call(
+    tool_name: str,
+    raw_args: str,
+    tool_models: dict[str, Type[BaseModel]],
+) -> MemoryActionType:
+    parsed_args = tool_models[tool_name].model_validate_json(raw_args)
+    return _build_memory_action_from_parsed_args(tool_name, parsed_args)
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -456,22 +534,13 @@ def _run_coro_in_new_loop(coro: Awaitable[T]) -> T:
         loop.close()
 
 
+def _start_daemon_thread(target: Callable[[], None]) -> threading.Thread:
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
 def _run_async_in_thread(coro: Awaitable[T]) -> T:
-    """Run async coroutine in dedicated thread with new event loop.
-
-    Use cases:
-        - Calling async code from sync context
-        - Avoiding event loop conflicts
-
-    Args:
-        coro: Coroutine to execute
-
-    Returns:
-        Result from coroutine execution
-
-    Raises:
-        Exception: Re-raises any exception from coroutine
-    """
     result_holder: dict[str, Any] = {}
     error_holder: dict[str, Exception] = {}
 
@@ -481,8 +550,7 @@ def _run_async_in_thread(coro: Awaitable[T]) -> T:
         except Exception as e:
             error_holder["error"] = e
 
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
+    thread = _start_daemon_thread(_runner)
     thread.join()
 
     if "error" in error_holder:
@@ -492,20 +560,13 @@ def _run_async_in_thread(coro: Awaitable[T]) -> T:
 
 
 def _run_detached(coro: Awaitable[Any]) -> None:
-    """Run coroutine in detached background thread (fire-and-forget).
-
-    Args:
-        coro: Coroutine to execute in background
-    """
-
     def _runner() -> None:
         try:
             _run_coro_in_new_loop(coro)
         except Exception as e:
             logging.getLogger(__name__).exception("Detached task failed: %s", e)
 
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
+    _start_daemon_thread(_runner)
 
 
 def _build_webui_request() -> Request:
@@ -631,7 +692,48 @@ def _ensure_table_exists():
         pass
 
 
+def _ensure_lifecycle_columns() -> None:
+    lifecycle_columns = {
+        "hard_expire_at": "BIGINT",
+        "access_count": "BIGINT",
+        "last_accessed_at": "BIGINT",
+        "last_decay_at": "BIGINT",
+        "strength": "FLOAT",
+        "pinned": "BOOLEAN",
+    }
+    backfill_statements = {
+        "hard_expire_at": "UPDATE auto_memory_expiry SET hard_expire_at = expired_at WHERE hard_expire_at IS NULL",
+        "access_count": "UPDATE auto_memory_expiry SET access_count = 0 WHERE access_count IS NULL",
+        "last_accessed_at": "UPDATE auto_memory_expiry SET last_accessed_at = updated_at WHERE last_accessed_at IS NULL",
+        "last_decay_at": "UPDATE auto_memory_expiry SET last_decay_at = updated_at WHERE last_decay_at IS NULL",
+        "strength": "UPDATE auto_memory_expiry SET strength = 100.0 WHERE strength IS NULL",
+        "pinned": "UPDATE auto_memory_expiry SET pinned = 0 WHERE pinned IS NULL",
+    }
+
+    try:
+        with engine.begin() as connection:
+            inspector = inspect(connection)
+            existing_columns = {
+                column["name"]
+                for column in inspector.get_columns(MemoryExpiry.__tablename__)
+            }
+
+            for column_name, column_type in lifecycle_columns.items():
+                if column_name not in existing_columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE {MemoryExpiry.__tablename__} "
+                            f"ADD COLUMN {column_name} {column_type}"
+                        )
+                    )
+
+                connection.execute(text(backfill_statements[column_name]))
+    except Exception:
+        pass
+
+
 _ensure_table_exists()
+_ensure_lifecycle_columns()
 
 
 R = TypeVar("R", bound=BaseModel)
@@ -780,20 +882,16 @@ class Filter:
             level="debug",
         )
 
-        for i in range(1, effective_messages_to_consider + 1):
-            if i > len(messages):
-                break
+        for index, message in self._iter_recent_messages_for_stringifying(
+            messages=messages,
+            limit=effective_messages_to_consider,
+        ):
             try:
-                message = messages[-i]
                 stringified_messages.append(
-                    STRINGIFIED_MESSAGE_TEMPLATE.format(
-                        index=i,
-                        role=message.get("role", "user"),
-                        content=message.get("content", ""),
-                    )
+                    self._format_stringified_message(index=index, message=message)
                 )
             except Exception as e:
-                self.log(f"error stringifying message {i}: {e}", level="warning")
+                self.log(f"error stringifying message {index}: {e}", level="warning")
 
         return "\n".join(stringified_messages)
 
@@ -865,34 +963,21 @@ class Filter:
         )
         api_key = self.user_valves.api_key or self.valves.api_key
 
-        if "gpt-5" in model_name:
-            temperature = 1.0
-            extra_args = {"reasoning_effort": "medium"}
-        elif "gemini-3" in model_name:
-            temperature = 1.0
-            extra_args = {}
-        else:
-            temperature = 0.3
-            extra_args = {}
+        temperature, extra_args = _resolve_chat_completion_settings(model_name)
 
         # Note: OpenAI SDK v1.0+ supports context manager, but we use direct instantiation
         # for simplicity since the client is short-lived within this method scope.
         # For long-lived clients, consider: with OpenAI(...) as client:
         client = OpenAI(api_key=api_key, base_url=api_url)
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-        request_args: dict[str, Any] = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            **extra_args,
-        }
-        if tools is not None:
-            request_args["tools"] = cast(Any, tools)
-        if tool_choice is not None:
-            request_args["tool_choice"] = cast(Any, tool_choice)
+        request_args = _build_chat_completion_request_args(
+            model_name=model_name,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=temperature,
+            extra_args=extra_args,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
         if response_model is None:
             response = client.chat.completions.create(**request_args)
@@ -904,10 +989,7 @@ class Filter:
 
             return text_response
 
-        if isinstance(response_model, dict):
-            model_label = f"tool-map[{', '.join(sorted(response_model.keys()))}]"
-        else:
-            model_label = cast(Any, response_model).__name__
+        model_label = _describe_tool_calling_response_model(response_model)
         self.log(
             f"calling tool-calling path with {model_label}",
             level="debug",
@@ -941,9 +1023,7 @@ class Filter:
             )
 
         if isinstance(response_model, dict):
-            actions: list[
-                Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]
-            ] = []
+            actions: list[MemoryActionType] = []
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 if tool_name not in response_model:
@@ -967,28 +1047,13 @@ class Filter:
                 )
 
                 try:
-                    parsed_args = response_model[tool_name].model_validate_json(
-                        raw_args
+                    actions.append(
+                        _parse_memory_action_tool_call(
+                            tool_name=tool_name,
+                            raw_args=raw_args,
+                            tool_models=response_model,
+                        )
                     )
-                    if tool_name == "add_memory":
-                        parsed_add = cast(MemoryAddToolRequest, parsed_args)
-                        actions.append(
-                            MemoryAddAction(action="add", content=parsed_add.content)
-                        )
-                    elif tool_name == "update_memory":
-                        parsed_update = cast(MemoryUpdateToolRequest, parsed_args)
-                        actions.append(
-                            MemoryUpdateAction(
-                                action="update",
-                                id=parsed_update.id,
-                                content=parsed_update.content,
-                            )
-                        )
-                    elif tool_name == "delete_memory":
-                        parsed_delete = cast(MemoryDeleteToolRequest, parsed_args)
-                        actions.append(
-                            MemoryDeleteAction(action="delete", id=parsed_delete.id)
-                        )
                 except Exception as e:
                     self.log(
                         f"skipping tool call {tool_name!r} due to parameter validation error: {e}",
@@ -1006,9 +1071,7 @@ class Filter:
             )
 
         tool_call = tool_calls[0]
-        raw_args = tool_call.function.arguments
-        if not raw_args or not raw_args.strip():
-            raise ValueError("tool call returned empty arguments")
+        raw_args = _require_tool_call_arguments(tool_call.function.arguments)
 
         self.log(f"tool call arguments: {raw_args[:500]}", level="debug")
         plan = model_cls.model_validate_json(raw_args)
@@ -1065,8 +1128,7 @@ class Filter:
             mem_id: Memory ID to initialize expiry for
             user_id: User ID who owns the memory
         """
-        now_timestamp = int(time.time())
-        expired_at = now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
+        expired_at = self._calculate_initial_expired_at(int(time.time()))
         existing = MemoryExpiries.get_by_mem_id(mem_id)
         if existing:
             MemoryExpiries.update_expired_at(mem_id, expired_at)
@@ -1231,44 +1293,26 @@ class Filter:
         Raises:
             ValueError: If no user message found in messages
         """
-        query_parts = []
+        query_parts: list[str] = []
 
-        # Find last user message and its index
-        last_user_idx = None
-        last_user_msg = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if messages[idx].get("role") == "user":
-                last_user_idx = idx
-                last_user_msg = messages[idx].get("content", "")
-                break
+        last_user_idx, last_user_msg = self._find_last_message_by_role(
+            messages=messages,
+            role="user",
+        )
 
         if last_user_msg is None or last_user_idx is None:
             raise ValueError("no user message found in messages")
 
-        # Count words in last user message
         user_word_count = len(last_user_msg.split())
-
-        # Check if we should include extra context for short messages
         include_extra_context = user_word_count <= SHORT_MESSAGE_WORD_THRESHOLD
 
-        # Build query from most recent to older messages
-        # Add last assistant response (if exists)
-        if last_user_idx + 1 < len(messages):
-            last_assistant_msg = messages[last_user_idx + 1].get("content", "")
-            if last_assistant_msg:
-                query_parts.append(f"Assistant: {last_assistant_msg}")
-
-        # Add last user message
-        query_parts.append(f"User: {last_user_msg}")
-
-        # If short message, add previous assistant context
-        if include_extra_context and last_user_idx > 0:
-            prev_assistant_msg = messages[last_user_idx - 1].get("content", "")
-            if (
-                prev_assistant_msg
-                and messages[last_user_idx - 1].get("role") == "assistant"
-            ):
-                query_parts.append(f"Assistant: {prev_assistant_msg}")
+        self._append_user_query_context(
+            messages=messages,
+            last_user_idx=last_user_idx,
+            last_user_msg=last_user_msg,
+            include_extra_context=include_extra_context,
+            query_parts=query_parts,
+        )
 
         # Reverse to get chronological order and join
         query_parts.reverse()
@@ -1359,16 +1403,10 @@ class Filter:
     # Helper Methods
     # ------------------------------------------------------------------------
     def build_inlet_memory_context(self, memories: list[Memory]) -> str:
-        memory_lines = []
-        for idx, memory in enumerate(memories, start=1):
-            score_text = (
-                f" (similarity={memory.similarity_score:.3f})"
-                if memory.similarity_score is not None
-                else ""
-            )
-            memory_lines.append(f"{idx}. {memory.content}{score_text}")
-
-        joined_memories = "\n".join(memory_lines)
+        joined_memories = "\n".join(
+            self._format_inlet_memory_line(idx=idx, memory=memory)
+            for idx, memory in enumerate(memories, start=1)
+        )
         return (
             f"{INLET_MEMORY_CONTEXT_PREFIX}\n"
             "Use these user memories as high-priority personalization context when relevant. "
@@ -1381,28 +1419,153 @@ class Filter:
         messages: list[dict[str, Any]],
         memory_context: str,
     ) -> list[dict[str, Any]]:
-        cleaned_messages = []
-        for message in messages:
-            is_old_memory_context = (
-                message.get("role") == "system"
-                and isinstance(message.get("content"), str)
-                and message["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
-            )
-            if not is_old_memory_context:
-                cleaned_messages.append(message)
+        cleaned_messages = [
+            message
+            for message in messages
+            if not self._is_inlet_memory_context_message(message)
+        ]
 
-        insert_at = 0
-        while (
-            insert_at < len(cleaned_messages)
-            and cleaned_messages[insert_at].get("role") == "system"
-        ):
-            insert_at += 1
+        insert_at = self._first_non_system_message_index(cleaned_messages)
 
         cleaned_messages.insert(
             insert_at,
             {"role": "system", "content": memory_context},
         )
         return cleaned_messages
+
+    def _iter_recent_messages_for_stringifying(
+        self,
+        messages: list[dict[str, Any]],
+        limit: int,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        recent_messages: list[tuple[int, dict[str, Any]]] = []
+        for index in range(1, limit + 1):
+            if index > len(messages):
+                break
+            recent_messages.append((index, messages[-index]))
+        return recent_messages
+
+    def _format_stringified_message(
+        self,
+        index: int,
+        message: dict[str, Any],
+    ) -> str:
+        return STRINGIFIED_MESSAGE_TEMPLATE.format(
+            index=index,
+            role=message.get("role", "user"),
+            content=message.get("content", ""),
+        )
+
+    def _find_last_message_by_role(
+        self,
+        messages: list[dict[str, Any]],
+        role: str,
+    ) -> tuple[int | None, str | None]:
+        for idx in range(len(messages) - 1, -1, -1):
+            message = messages[idx]
+            if message.get("role") == role:
+                return idx, message.get("content", "")
+        return None, None
+
+    def _append_user_query_context(
+        self,
+        messages: list[dict[str, Any]],
+        last_user_idx: int,
+        last_user_msg: str,
+        include_extra_context: bool,
+        query_parts: list[str],
+    ) -> None:
+        if last_user_idx + 1 < len(messages):
+            last_assistant_msg = messages[last_user_idx + 1].get("content", "")
+            if last_assistant_msg:
+                query_parts.append(f"Assistant: {last_assistant_msg}")
+
+        query_parts.append(f"User: {last_user_msg}")
+
+        if include_extra_context and last_user_idx > 0:
+            previous_message = messages[last_user_idx - 1]
+            previous_assistant_msg = previous_message.get("content", "")
+            if previous_message.get("role") == "assistant" and previous_assistant_msg:
+                query_parts.append(f"Assistant: {previous_assistant_msg}")
+
+    def _format_inlet_memory_line(self, idx: int, memory: Memory) -> str:
+        score_text = (
+            f" (similarity={memory.similarity_score:.3f})"
+            if memory.similarity_score is not None
+            else ""
+        )
+        return f"{idx}. {memory.content}{score_text}"
+
+    def _is_inlet_memory_context_message(self, message: dict[str, Any]) -> bool:
+        return (
+            message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith(INLET_MEMORY_CONTEXT_PREFIX)
+        )
+
+    def _first_non_system_message_index(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> int:
+        insert_at = 0
+        while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+            insert_at += 1
+        return insert_at
+
+    def _calculate_initial_expired_at(self, now_timestamp: int) -> int:
+        return now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
+
+    def _calculate_boosted_expired_at(
+        self,
+        existing_expired_at: int,
+        now_timestamp: int,
+        hard_expire_at: int | None = None,
+    ) -> int:
+        extension_seconds = self.valves.extension_days * SECONDS_PER_DAY
+        max_expiry_seconds = self.valves.max_expiry_days * SECONDS_PER_DAY
+        extended_from_existing = existing_expired_at + extension_seconds
+        extended_from_now = now_timestamp + extension_seconds
+        extended_expired_at = max(extended_from_existing, extended_from_now)
+        max_allowed_expired_at = (
+            hard_expire_at
+            if hard_expire_at is not None
+            else now_timestamp + max_expiry_seconds
+        )
+        return min(extended_expired_at, max_allowed_expired_at)
+
+    async def _cleanup_expired_memory_record(
+        self,
+        mem_id: str,
+        user: UserModel,
+        expiry_table: MemoryExpiryTable,
+    ) -> bool:
+        try:
+            await asyncio.to_thread(
+                self._delete_memory_sync,
+                mem_id=mem_id,
+                user=user,
+            )
+            self.log(
+                f"deleted memory from vector DB: {mem_id[:8]}...",
+                level="debug",
+            )
+        except Exception as e:
+            self.log(
+                f"failed to delete memory from vector DB {mem_id}: {e}. "
+                f"Memory may have been manually deleted. Continuing to clean up expiry record.",
+                level="warning",
+            )
+
+        try:
+            expiry_table.delete_by_mem_id(mem_id)
+            self.log(f"deleted expiry record: {mem_id[:8]}...", level="debug")
+            return True
+        except Exception as e:
+            self.log(
+                f"failed to delete expiry record {mem_id}: {e}",
+                level="error",
+            )
+            return False
 
     # ------------------------------------------------------------------------
     # Memory Lifecycle Management
@@ -1438,35 +1601,12 @@ class Filter:
 
         deleted_count = 0
         for record in expired_records:
-            try:
-                await asyncio.to_thread(
-                    self._delete_memory_sync,
-                    mem_id=str(record.mem_id),
-                    user=user,
-                )
-                self.log(
-                    f"deleted memory from vector DB: {record.mem_id[:8]}...",
-                    level="debug",
-                )
-            except Exception as e:
-                self.log(
-                    f"failed to delete memory from vector DB {record.mem_id}: {e}. "
-                    f"Memory may have been manually deleted. Continuing to clean up expiry record.",
-                    level="warning",
-                )
-
-            # Always try to delete from expiry table, even if vector DB deletion failed
-            try:
-                expiry_table.delete_by_mem_id(str(record.mem_id))
+            if await self._cleanup_expired_memory_record(
+                mem_id=str(record.mem_id),
+                user=user,
+                expiry_table=expiry_table,
+            ):
                 deleted_count += 1
-                self.log(
-                    f"deleted expiry record: {record.mem_id[:8]}...", level="debug"
-                )
-            except Exception as e:
-                self.log(
-                    f"failed to delete expiry record {record.mem_id}: {e}",
-                    level="error",
-                )
 
         self.log(
             f"cleanup complete: deleted {deleted_count} memories",
@@ -1509,46 +1649,34 @@ class Filter:
 
         for memory in related_memories:
             try:
-                # Check if expiry record exists
                 existing = expiry_table.get_by_mem_id(memory.mem_id)
 
                 if existing:
-                    # Extend expiry from existing expired_at, not from now
-                    # This ensures we truly "extend by N days" rather than "reset to N days from now"
-                    extended_from_existing = int(existing.expired_at) + (  # pyright: ignore[reportArgumentType]
-                        self.valves.extension_days * SECONDS_PER_DAY
+                    previous_expired_at = int(existing.expired_at)  # pyright: ignore[reportArgumentType]
+                    existing_hard_expire_at = getattr(existing, "hard_expire_at", None)
+                    new_expired_at = self._calculate_boosted_expired_at(
+                        existing_expired_at=previous_expired_at,
+                        now_timestamp=now_timestamp,
+                        hard_expire_at=(
+                            int(existing_hard_expire_at)
+                            if existing_hard_expire_at is not None
+                            else None
+                        ),
                     )
-
-                    # Ensure at least extension_days from now (handles already-expired memories)
-                    extended_from_now = now_timestamp + (
-                        self.valves.extension_days * SECONDS_PER_DAY
-                    )
-
-                    # Take the maximum to ensure we always give at least extension_days
-                    extended_expired_at = max(extended_from_existing, extended_from_now)
-
-                    # Apply maximum expiry limit to prevent indefinite extension
-                    max_allowed_expired_at = now_timestamp + (
-                        self.valves.max_expiry_days * SECONDS_PER_DAY
-                    )
-                    new_expired_at = min(extended_expired_at, max_allowed_expired_at)
 
                     expiry_table.update_expired_at(memory.mem_id, new_expired_at)
                     stats["boosted"] += 1
 
                     days_extended = (
-                        new_expired_at - int(existing.expired_at)  # pyright: ignore[reportArgumentType]
-                    ) / SECONDS_PER_DAY  # type: ignore
+                        new_expired_at - previous_expired_at
+                    ) / SECONDS_PER_DAY
                     self.log(
                         f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
                         f"(requested {self.valves.extension_days}, capped at {self.valves.max_expiry_days} days from now)",
                         level="debug",
                     )
                 else:
-                    # Create new record
-                    new_expired_at = now_timestamp + (
-                        self.valves.initial_expiry_days * SECONDS_PER_DAY
-                    )
+                    new_expired_at = self._calculate_initial_expired_at(now_timestamp)
                     expiry_table.insert(
                         mem_id=memory.mem_id,
                         user_id=user.id,
@@ -1573,6 +1701,92 @@ class Filter:
     # ------------------------------------------------------------------------
     # Main Business Flow
     # ------------------------------------------------------------------------
+    async def _emit_memory_lifecycle_statuses(
+        self,
+        boost_stats: dict[str, int],
+        deleted_count: int,
+        emitter: Callable[[Any], Awaitable[None]],
+    ) -> None:
+        if not self.user_valves.show_status:
+            return
+
+        if boost_stats["boosted"] > 0:
+            await emit_status(
+                f"延长{boost_stats['boosted']}个记忆",
+                emitter=emitter,
+                status="complete",
+            )
+        if boost_stats["created"] > 0:
+            await emit_status(
+                f"初始化{boost_stats['created']}个记忆",
+                emitter=emitter,
+                status="complete",
+            )
+        if deleted_count > 0:
+            await emit_status(
+                f"清理{deleted_count}个记忆",
+                emitter=emitter,
+                status="complete",
+            )
+
+    def _find_latest_user_message(self, messages: list[dict[str, Any]]) -> str:
+        return next(
+            (
+                cast(str, message.get("content", ""))
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+
+    def _build_memory_planning_input(
+        self,
+        messages: list[dict[str, Any]],
+        related_memories: list[Memory],
+    ) -> str:
+        stringified_memories = json.dumps(
+            [memory.model_dump(mode="json") for memory in related_memories]
+        )
+        conversation_str = self.messages_to_string(messages)
+        latest_user_message = self._find_latest_user_message(messages)
+        return (
+            f"LATEST_USER_MESSAGE:\n{latest_user_message}\n\n"
+            f"RECENT_CONVERSATION_SNIPPET:\n{conversation_str}\n\n"
+            f"RELATED_MEMORIES_JSON:\n{stringified_memories}"
+        )
+
+    def _limit_existing_memory_ids_for_tools(
+        self,
+        related_memories: list[Memory],
+    ) -> list[str]:
+        existing_ids = [memory.mem_id for memory in related_memories]
+        if len(existing_ids) <= MAX_MEMORY_IDS_FOR_TOOLS:
+            return existing_ids
+
+        self.log(
+            f"truncating memory action ID constraints from {len(existing_ids)} to {MAX_MEMORY_IDS_FOR_TOOLS}",
+            level="warning",
+        )
+        return existing_ids[:MAX_MEMORY_IDS_FOR_TOOLS]
+
+    async def _plan_memory_actions(
+        self,
+        messages: list[dict[str, Any]],
+        related_memories: list[Memory],
+    ) -> MemoryActionRequestStub:
+        planning_input = self._build_memory_planning_input(messages, related_memories)
+        tool_models, tool_definitions, tool_choice = build_memory_action_tools(
+            self._limit_existing_memory_ids_for_tools(related_memories)
+        )
+        action_plan = await self.query_openai_sdk(
+            system_prompt=UNIFIED_SYSTEM_PROMPT,
+            user_message=planning_input,
+            response_model=tool_models,
+            tools=tool_definitions,
+            tool_choice=tool_choice,
+        )
+        return cast(MemoryActionRequestStub, action_plan)
+
     async def auto_memory(
         self,
         messages: list[dict[str, Any]],
@@ -1596,65 +1810,14 @@ class Filter:
 
         # === Cleanup Expired Memories ===
         deleted_count = await self.cleanup_expired_memories(user)
-
-        if self.user_valves.show_status:
-            if boost_stats["boosted"] > 0:
-                await emit_status(
-                    f"延长{boost_stats['boosted']}个记忆",
-                    emitter=emitter,
-                    status="complete",
-                )
-            if boost_stats["created"] > 0:
-                await emit_status(
-                    f"初始化{boost_stats['created']}个记忆",
-                    emitter=emitter,
-                    status="complete",
-                )
-            if deleted_count > 0:
-                await emit_status(
-                    f"清理{deleted_count}个记忆",
-                    emitter=emitter,
-                    status="complete",
-                )
-
-        stringified_memories = json.dumps(
-            [memory.model_dump(mode="json") for memory in related_memories]
-        )
-        conversation_str = self.messages_to_string(messages)
-        latest_user_message = next(
-            (
-                m.get("content", "")
-                for m in reversed(messages)
-                if m.get("role") == "user"
-            ),
-            "",
-        )
-        planning_input = (
-            f"LATEST_USER_MESSAGE:\n{latest_user_message}\n\n"
-            f"RECENT_CONVERSATION_SNIPPET:\n{conversation_str}\n\n"
-            f"RELATED_MEMORIES_JSON:\n{stringified_memories}"
+        await self._emit_memory_lifecycle_statuses(
+            boost_stats=boost_stats,
+            deleted_count=deleted_count,
+            emitter=emitter,
         )
 
         try:
-            existing_ids = [m.mem_id for m in related_memories]
-            if len(existing_ids) > MAX_MEMORY_IDS_FOR_TOOLS:
-                self.log(
-                    f"truncating memory action ID constraints from {len(existing_ids)} to {MAX_MEMORY_IDS_FOR_TOOLS}",
-                    level="warning",
-                )
-                existing_ids = existing_ids[:MAX_MEMORY_IDS_FOR_TOOLS]
-
-            tool_models, tool_definitions, tool_choice = build_memory_action_tools(
-                existing_ids
-            )
-            action_plan = await self.query_openai_sdk(
-                system_prompt=UNIFIED_SYSTEM_PROMPT,
-                user_message=planning_input,
-                response_model=tool_models,
-                tools=tool_definitions,
-                tool_choice=tool_choice,
-            )
-            action_plan = cast(MemoryActionRequestStub, action_plan)
+            action_plan = await self._plan_memory_actions(messages, related_memories)
             self.log(f"action plan: {action_plan}", level="debug")
 
             if not action_plan.actions:
@@ -1692,75 +1855,200 @@ class Filter:
         if self.valves.debug_mode:
             self.log(f"memory actions to apply: {actions}", level="debug")
 
-        action_groups = {
-            action_name: [a for a in actions if a.action == action_name]
-            for action_name in ACTION_ORDER
-        }
-        counts: dict[str, int] = {action_name: 0 for action_name in ACTION_ORDER}
+        counts = self._initialize_action_counts()
+        action_groups = self._group_memory_actions(actions)
 
         for action_name in ACTION_ORDER:
-            for action in action_groups[action_name]:
-                try:
-                    if action_name == "delete":
-                        delete_action = cast(MemoryDeleteAction, action)
-                        await self._delete_memory_with_db(delete_action, user)
-                        self.log(f"deleted memory. id={delete_action.id}")
-                    elif action_name == "update":
-                        update_action = cast(MemoryUpdateAction, action)
-                        if not update_action.content.strip():
-                            continue
-                        await update_memory_by_id(
-                            memory_id=update_action.id,
-                            request=_build_webui_request(),
-                            form_data=MemoryUpdateModel(content=update_action.content),
-                            user=user,
-                        )
-                        self.log(f"updated memory. id={update_action.id}")
-                    else:
-                        add_action = cast(MemoryAddAction, action)
-                        if not add_action.content.strip():
-                            continue
-                        await self._add_memory_with_expiry(add_action, user)
-                        self.log(f"added memory. content={add_action.content}")
-                    counts[action_name] += 1
-                except Exception as e:
-                    action_hint = (
-                        f"{action_name} memory"
-                        if action_name == "add"
-                        else f"{action_name} memory {cast(Any, action).id}"
-                    )
-                    self.log(
-                        f"memory action failed: failed to {action_hint}: {e}",
-                        level="error",
-                    )
-                    # Continue with next action instead of raising
+            await self._apply_memory_action_group(
+                action_name=action_name,
+                actions=action_groups[action_name],
+                user=user,
+                counts=counts,
+            )
 
-        status_labels = {"delete": "删除", "update": "更新", "add": "新增"}
-        has_actions = any(counts[action_name] > 0 for action_name in ACTION_ORDER)
+        await self._log_and_emit_memory_action_summary(counts=counts, emitter=emitter)
 
-        if has_actions:
-            log_parts = []
-            for action_name in ACTION_ORDER:
-                count = counts[action_name]
-                if count > 0:
-                    log_parts.append(f"{status_labels[action_name]}{count}个记忆")
-            self.log(", ".join(log_parts), level="info")
+    def _initialize_action_counts(self) -> dict[str, int]:
+        return {action_name: 0 for action_name in ACTION_ORDER}
+
+    def _group_memory_actions(
+        self,
+        actions: list[Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]],
+    ) -> dict[
+        str, list[Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]]
+    ]:
+        return {
+            action_name: [action for action in actions if action.action == action_name]
+            for action_name in ACTION_ORDER
+        }
+
+    async def _apply_memory_action_group(
+        self,
+        action_name: Literal["delete", "update", "add"],
+        actions: list[Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction]],
+        user: UserModel,
+        counts: dict[str, int],
+    ) -> None:
+        for action in actions:
+            await self._apply_memory_action_with_isolation(
+                action_name=action_name,
+                action=action,
+                user=user,
+                counts=counts,
+            )
+
+    async def _apply_memory_action_with_isolation(
+        self,
+        action_name: Literal["delete", "update", "add"],
+        action: Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction],
+        user: UserModel,
+        counts: dict[str, int],
+    ) -> None:
+        try:
+            applied = await self._execute_memory_action(
+                action_name=action_name,
+                action=action,
+                user=user,
+            )
+            if applied:
+                counts[action_name] += 1
+        except Exception as e:
+            self.log(
+                f"memory action failed: failed to {self._build_memory_action_hint(action_name, action)}: {e}",
+                level="error",
+            )
+            # Continue with next action instead of raising
+
+    async def _execute_memory_action(
+        self,
+        action_name: Literal["delete", "update", "add"],
+        action: Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction],
+        user: UserModel,
+    ) -> bool:
+        if action_name == "delete":
+            delete_action = cast(MemoryDeleteAction, action)
+            await self._delete_memory_with_db(delete_action, user)
+            self.log(f"deleted memory. id={delete_action.id}")
+            return True
+
+        if action_name == "update":
+            update_action = cast(MemoryUpdateAction, action)
+            if not update_action.content.strip():
+                return False
+            await update_memory_by_id(
+                memory_id=update_action.id,
+                request=_build_webui_request(),
+                form_data=MemoryUpdateModel(content=update_action.content),
+                user=user,
+            )
+            self.log(f"updated memory. id={update_action.id}")
+            return True
+
+        add_action = cast(MemoryAddAction, action)
+        if not add_action.content.strip():
+            return False
+        await self._add_memory_with_expiry(add_action, user)
+        self.log(f"added memory. content={add_action.content}")
+        return True
+
+    def _build_memory_action_hint(
+        self,
+        action_name: Literal["delete", "update", "add"],
+        action: Union[MemoryAddAction, MemoryUpdateAction, MemoryDeleteAction],
+    ) -> str:
+        if action_name == "add":
+            return f"{action_name} memory"
+        return f"{action_name} memory {cast(Any, action).id}"
+
+    def _memory_action_status_labels(self) -> dict[str, str]:
+        return {"delete": "删除", "update": "更新", "add": "新增"}
+
+    def _build_memory_action_summary_parts(self, counts: dict[str, int]) -> list[str]:
+        status_labels = self._memory_action_status_labels()
+        return [
+            f"{status_labels[action_name]}{counts[action_name]}个记忆"
+            for action_name in ACTION_ORDER
+            if counts[action_name] > 0
+        ]
+
+    async def _log_and_emit_memory_action_summary(
+        self,
+        counts: dict[str, int],
+        emitter: Callable[[Any], Awaitable[None]],
+    ) -> None:
+        summary_parts = self._build_memory_action_summary_parts(counts)
+
+        if summary_parts:
+            self.log(", ".join(summary_parts), level="info")
         else:
             self.log("no changes", level="info")
 
-        if self.user_valves.show_status:
-            for action_name in ACTION_ORDER:
-                count = counts[action_name]
-                if count > 0:
-                    await emit_status(
-                        f"{status_labels[action_name]}{count}个记忆",
-                        emitter=emitter,
-                        status="complete",
-                    )
+        if not self.user_valves.show_status:
+            return
+
+        for summary_part in summary_parts:
+            await emit_status(summary_part, emitter=emitter, status="complete")
 
     # ------------------------------------------------------------------------
     # Plugin Lifecycle Hooks
     # ------------------------------------------------------------------------
+    def _resolve_inlet_user(
+        self, __user__: Optional[dict[str, object]]
+    ) -> UserModel | None:
+        if __user__ is None:
+            return None
+
+        user_id = __user__.get("id")
+        if not isinstance(user_id, str) or not user_id:
+            self.log(
+                "inlet context injection skipped: invalid user id", level="warning"
+            )
+            return None
+
+        user = Users.get_user_by_id(user_id)
+        if user is None:
+            self.log("inlet context injection skipped: user not found", level="warning")
+            return None
+
+        return user
+
+    def _resolve_inlet_messages(
+        self, body: dict[str, object]
+    ) -> list[dict[str, Any]] | None:
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or len(messages) < 1:
+            return None
+        return cast(list[dict[str, Any]], messages)
+
+    def _resolve_inlet_memory_query_settings(self) -> tuple[int, float | None]:
+        inlet_top_k = (
+            self.valves.inlet_related_memories_n or self.valves.related_memories_n
+        )
+        inlet_threshold = (
+            self.valves.minimum_memory_similarity
+            if self.valves.inlet_minimum_memory_similarity is None
+            else self.valves.inlet_minimum_memory_similarity
+        )
+        return inlet_top_k, inlet_threshold
+
+    def _fetch_inlet_related_memories(
+        self,
+        messages: list[dict[str, Any]],
+        user: UserModel,
+    ) -> list[Memory]:
+        inlet_top_k, inlet_threshold = self._resolve_inlet_memory_query_settings()
+        return cast(
+            list[Memory],
+            _run_async_in_thread(
+                self.get_related_memories(
+                    messages=messages,
+                    user=user,
+                    top_k=inlet_top_k,
+                    minimum_similarity=inlet_threshold,
+                )
+            ),
+        )
+
     def inlet(
         self,
         body: dict[str, object],
@@ -1775,45 +2063,18 @@ class Filter:
 
         if not self.valves.enable_inlet_memory_context:
             return body
-        if __user__ is None:
-            return body
 
-        user_id = __user__.get("id")
-        if not isinstance(user_id, str) or not user_id:
-            self.log(
-                "inlet context injection skipped: invalid user id", level="warning"
-            )
-            return body
-
-        user = Users.get_user_by_id(user_id)
+        user = self._resolve_inlet_user(__user__)
         if user is None:
-            self.log("inlet context injection skipped: user not found", level="warning")
             return body
 
-        messages = body.get("messages", [])
-        if not isinstance(messages, list) or len(messages) < 1:
+        messages = self._resolve_inlet_messages(body)
+        if messages is None:
             return body
-
-        inlet_top_k = (
-            self.valves.inlet_related_memories_n or self.valves.related_memories_n
-        )
-        inlet_threshold = (
-            self.valves.minimum_memory_similarity
-            if self.valves.inlet_minimum_memory_similarity is None
-            else self.valves.inlet_minimum_memory_similarity
-        )
 
         try:
-            related_memories = cast(
-                list[Memory],
-                _run_async_in_thread(
-                    self.get_related_memories(
-                        messages=messages,
-                        user=user,
-                        top_k=inlet_top_k,
-                        minimum_similarity=inlet_threshold,
-                    )
-                ),
+            related_memories = self._fetch_inlet_related_memories(
+                messages=messages, user=user
             )
         except Exception as e:
             self.log(f"inlet memory context injection failed: {e}", level="warning")
@@ -1834,6 +2095,53 @@ class Filter:
 
         return body
 
+    def _should_skip_outlet_for_chat(self, chat_id: object) -> bool:
+        return not chat_id or (
+            isinstance(chat_id, str) and chat_id.startswith("local:")
+        )
+
+    def _resolve_outlet_user(self, __user__: dict[str, object]) -> UserModel:
+        user = Users.get_user_by_id(str(__user__["id"]))
+        if user is None:
+            raise ValueError("user not found")
+        return user
+
+    def _memories_globally_enabled(self) -> bool:
+        return bool(webui_app.state.config.ENABLE_MEMORIES)
+
+    def _user_has_memories_permission(self, user: UserModel) -> bool:
+        return has_permission(
+            user.id, "features.memories", webui_app.state.config.USER_PERMISSIONS
+        )
+
+    def _memory_enabled_in_user_settings(self, user: UserModel) -> bool:
+        return not (
+            user.settings and not (user.settings.ui or {}).get("memory", True)  # type: ignore
+        )
+
+    def _resolve_outlet_user_valves(
+        self,
+        __user__: dict[str, object],
+    ) -> "Filter.UserValves":
+        user_valves = __user__.get("valves", self.UserValves())  # pyright: ignore[reportAttributeAccessIssue]
+        if not isinstance(user_valves, self.UserValves):
+            raise ValueError("invalid user valves")
+        return cast(Filter.UserValves, user_valves)
+
+    def _schedule_auto_memory_outlet_task(
+        self,
+        body: dict[str, object],
+        user: UserModel,
+        emitter: Callable[[Any], Awaitable[None]],
+    ) -> None:
+        _run_detached(
+            self.auto_memory(
+                messages=cast(list[dict[str, Any]], body.get("messages", [])),
+                user=user,
+                emitter=emitter,
+            )
+        )
+
     async def outlet(
         self,
         body: dict[str, object],
@@ -1845,16 +2153,14 @@ class Filter:
             raise ValueError("user information is required")
 
         chat_id = body.get("chat_id")
-        if not chat_id or (isinstance(chat_id, str) and chat_id.startswith("local:")):
+        if self._should_skip_outlet_for_chat(chat_id):
             self.log("temporary chat, skipping", level="info")
             return body
 
-        user = Users.get_user_by_id(str(__user__["id"]))
-        if user is None:
-            raise ValueError("user not found")
+        user = self._resolve_outlet_user(__user__)
 
         # Check global memories toggle (upstream: ENABLE_MEMORIES config flag)
-        if not webui_app.state.config.ENABLE_MEMORIES:
+        if not self._memories_globally_enabled():
             self.log(
                 "memories are disabled globally (ENABLE_MEMORIES=False), skipping",
                 level="info",
@@ -1862,9 +2168,7 @@ class Filter:
             return body
 
         # Check per-user memories permission (upstream: features.memories permission)
-        if not has_permission(
-            user.id, "features.memories", webui_app.state.config.USER_PERMISSIONS
-        ):
+        if not self._user_has_memories_permission(user):
             self.log(
                 f"user {user.id} does not have 'features.memories' permission, skipping",
                 level="info",
@@ -1881,29 +2185,24 @@ class Filter:
 
         # Check if memory is disabled in user settings
         # user.settings is Optional[UserSettings], where UserSettings.ui is Optional[dict]
-        if user.settings and not (user.settings.ui or {}).get("memory", True):  # type: ignore
+        if not self._memory_enabled_in_user_settings(user):
             self.log(
                 "memory is disabled in user's personalization settings, skipping",
                 level="info",
             )
             return body
 
-        self.user_valves = __user__.get("valves", self.UserValves())  # pyright: ignore[reportAttributeAccessIssue]
-        if not isinstance(self.user_valves, self.UserValves):
-            raise ValueError("invalid user valves")
-        self.user_valves = cast(Filter.UserValves, self.user_valves)
+        self.user_valves = self._resolve_outlet_user_valves(__user__)
         self.log(f"user valves = {self.user_valves}", level="debug")
 
         if not self.user_valves.enabled:
             self.log("component was disabled by user, skipping", level="info")
             return body
 
-        _run_detached(
-            self.auto_memory(
-                messages=body.get("messages", []),  # type: ignore[arg-type]
-                user=user,
-                emitter=__event_emitter__,
-            )
+        self._schedule_auto_memory_outlet_task(
+            body=body,
+            user=user,
+            emitter=__event_emitter__,
         )
 
         return body

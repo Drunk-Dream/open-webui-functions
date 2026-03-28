@@ -1,9 +1,96 @@
 {
-  "active_plan": "/home/dongmh/source/open-webui-functions/.sisyphus/plans/auto-chat-cleanup-plugin.md",
-  "started_at": "2026-03-10T10:55:35.754Z",
+  "active_plan": "/home/dongmh/source/open-webui-functions/.sisyphus/plans/auto-memory-full-file-refactor.md",
+  "started_at": "2026-03-27T15:10:51.150Z",
   "session_ids": [
-    "ses_3289cb10cffeYc2eKsecxWlfYv"
+    "ses_2d026e5b8ffeO0ssygeELYIOpJ",
+    "ses_2d026725dffe4u1j7TAUGkpr1A",
+    "ses_2d0267171ffeGjvORUhLWu9p9a",
+    "ses_2d024daf2ffeOjQguLIiiCdLv4",
+    "ses_2d01c6f5dffe4iesoiRYeCLEYl",
+    "ses_2d009b5b1ffe5cRzeUw0ZPbuFy",
+    "ses_2d004cbc8ffeYEFGqxIaAhI4OB",
+    "ses_2d004cca1ffeDyS6Zeeu525W6z",
+    "ses_2d0016952ffex9hMoftA0iGCgv",
+    "ses_2d0016916ffe21OpxUsnHAVz4L",
+    "ses_2cffc08a1ffedvZlCHQJg7YVDk",
+    "ses_2cff53b45ffeTBg6ytVqFTUEBj",
+    "ses_2cff53b8bffe9tVEVPCtI6rR5M",
+    "ses_2cff53b47ffeazAXODjAylVefQ",
+    "ses_2cff53b41ffe8XQ0P2ZgguWw6W"
   ],
-  "plan_name": "auto-chat-cleanup-plugin",
-  "agent": "atlas"
+  "plan_name": "auto-memory-full-file-refactor",
+  "agent": "atlas",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "冻结现有外部契约与不可变行为基线",
+      "session_id": "ses_2d024daf2ffeOjQguLIiiCdLv4",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-03-27T15:15:04.228Z"
+    },
+    "todo:2": {
+      "task_key": "todo:2",
+      "task_label": "2",
+      "task_title": "为未充分覆盖的边界语义补足回归用例",
+      "session_id": "ses_2d01c6f5dffe4iesoiRYeCLEYl",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-03-27T15:26:40.158Z"
+    },
+    "todo:3": {
+      "task_key": "todo:3",
+      "task_label": "3",
+      "task_title": "记录并保留导入时初始化与运行时副作用顺序",
+      "session_id": "ses_2d00cacd0ffeNw0PwxSqKpDKD8",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-03-27T15:41:17.827Z"
+    },
+    "todo:4": {
+      "task_key": "todo:4",
+      "task_label": "4",
+      "task_title": "提取并内聚 planner/schema 纯函数辅助层（仍保留在单文件内）",
+      "session_id": "ses_2d009b5b1ffe5cRzeUw0ZPbuFy",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-27T15:46:26.943Z"
+    },
+    "todo:5": {
+      "task_key": "todo:5",
+      "task_label": "5",
+      "task_title": "清理消息拼接与 memory query 构造的重复逻辑",
+      "session_id": "ses_2d004cca1ffeDyS6Zeeu525W6z",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-03-27T15:49:42.148Z"
+    },
+    "todo:7": {
+      "task_key": "todo:7",
+      "task_label": "7",
+      "task_title": "收敛 expiry CRUD、cleanup 与 boost 的生命周期逻辑",
+      "session_id": "ses_2d0016952ffex9hMoftA0iGCgv",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-27T15:54:41.626Z"
+    },
+    "todo:9": {
+      "task_key": "todo:9",
+      "task_label": "9",
+      "task_title": "精简 Filter 编排层，重写 `auto_memory()` / `inlet()` / `outlet()` 的可读性结构",
+      "session_id": "ses_2cffc08a1ffedvZlCHQJg7YVDk",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-27T16:02:05.340Z"
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "Plan Compliance Audit — oracle",
+      "session_id": "ses_2cff53b45ffeTBg6ytVqFTUEBj",
+      "agent": "oracle",
+      "updated_at": "2026-03-27T16:06:18.479Z"
+    }
+  }
 }

@@ -1,0 +1,23 @@
+
+2026-03-27:
+- `tests/test_auto_memory_function_calling.py` 已经形成稳定契约覆盖：function-calling 顺序、严格 schema 拒绝、inlet memory block 注入/替换、cleanup 空结果、boost 空输入、以及 `_run_coro_in_new_loop()` / `_build_webui_request()` 的基础语义都能在同一文件里冻结。
+- 现有测试风格偏向直接 patch 模块级依赖和用轻量 `MagicMock`/`SimpleNamespace` 记录副作用，适合做重构前契约回归。
+- 新增边界回归已锁定：`query_openai_sdk()` 在 dict-mode 下对 no-tool-call/坏参数是“跳过并返回空 actions”，而 single-model-mode 下同场景抛错（无 tool call 抛 `ValueError`，坏 JSON 抛 `ValidationError`）。
+- `apply_memory_actions()` 当前语义已冻结：单条 action 失败不会中断后续 action；`update/add` 的 blank/whitespace `content` 会被跳过，不计入执行。
+- `auto_memory()` 的 `existing_ids` 约束在超过 `MAX_MEMORY_IDS_FOR_TOOLS` 时按前 50 条截断并传给 `build_memory_action_tools()`；该边界现已可回归验证。
+- 导入期初始化采用非侵入锁定：通过 reload + patch `Base.metadata.create_all` 验证导入时会调用 `checkfirst=True` 的建表路径，而不改生产实现。
+- 这次补了一条更轻的结构回归：用 AST 读取模块源码，确认 `MemoryExpiries = MemoryExpiryTable()` 仍然位于 `_ensure_table_exists()` 定义/调用之前，从而把“导入期执行而非 lazy init”的边界锁在源码顺序上。
+- 任务4重构里，适合纯化且不碰 OpenAI I/O 的 planner/schema 逻辑包括：模型温度/extra_args 选择、chat completion request_args 组装、tool-call 参数非空检查、dict-mode tool args -> action 对象翻译；把这些 helper 收口后，`query_openai_sdk()` 可以只保留 orchestration。
+- `build_memory_action_tools()` 的 strict schema 与动态 ID literal 校验无需参与 helper 抽取；只要继续把 dict-mode 的解析输入保持为该函数返回的 `tool_models`，invalid-id 与 extra-keys 契约就会自然保留。
+- 任务5里把重复字符串拼接与索引决策收口成纯 helper 后，`messages_to_string()`、`build_memory_query()`、`build_inlet_memory_context()`、`inject_memory_context_into_messages()` 的对外语义可以通过更少的局部规则表达，且更容易逐项回归。
+- 适合继续沿用的模式是：把“最近消息枚举”“最后一个指定 role 的索引查找”“inlet system block 识别/插入点计算”拆成小纯函数，再由主函数维持原有顺序与条件分支。
+- 任务6把 async/thread/request 桥接层收口为四个边界：`_run_coro_in_new_loop()` 只负责新 loop 执行，`_start_daemon_thread()` 只负责守护线程创建/启动，`_run_async_in_thread()` 只负责同步等待并透传结果/异常，`_run_detached()` 只负责 fire-and-forget 加失败日志。
+- `_build_webui_request()` 维持最小 `Request(scope={"type": "http", "app": webui_app})` 形状不变，避免把请求对象构造和执行语义混在一起。
+- 任务8里 `apply_memory_actions()` 适合继续沿用“主体只保留顺序编排、helper 下沉细节”的模式：主函数只做 `ACTION_ORDER` 驱动分组遍历，具体 action 执行、单条失败隔离、错误 hint 拼接、摘要/状态发送分别收口到独立 helper，即可在不改变 delete/update/add 顺序与 no-op 语义的前提下显著降低主体复杂度。
+- 任务7里把 expiry lifecycle 的重复公式收口成 `_calculate_initial_expired_at()` 与 `_calculate_boosted_expired_at()` 后，`_initialize_memory_expiry()`、`boost_memories()` 的 existing/missing 分支更容易读，但对外仍保持相同的 initial-expiry、boost 延长与 hard-cap 语义。
+- `cleanup_expired_memories()` 适合提炼成“单条 record 清理 helper + 外层统计循环”的结构：这样能显式保留“向量删除失败也继续删 expiry 记录，且只有 expiry 删除成功才计数”的原有契约。
+- 任务9里 `auto_memory()` 可以继续压成纯 orchestration：生命周期状态 emit、planner 输入拼装、existing memory id 截断与 planner 调用都收口到私有 helper 后，主体只剩 gating/query/boost/cleanup/plan/apply 顺序，且更容易检查顺序未漂移。
+- `inlet()` / `outlet()` 的可读性提升适合采用“早返回 + 解析 helper + 调度 helper”模式：把 user/messages 解析、inlet query 参数决策、outlet 权限/开关判断与 detached 调度分别抽出，同文件内保留 bridge 语义而不改外部 hook 签名。
+- task-9 返工里，导入期 bootstrap 约束需要同时显式保留 `_ensure_table_exists()` 与 `_ensure_lifecycle_columns()` 的模块级调用；测试更稳妥的锁法是约束“定义存在 + 调用存在 + 调用顺序正确”，不要把函数定义位置误当成必须晚于前一个调用。
+- reviewer 对模块头部版本注记会按“是否暗示行为变化”来判定行为保持型重构是否越界；这类 refactor 只应移除误导性变更说明，不应新增会被解读为语义变更的版本条目。
+- 最后一轮 lifecycle 修正里，`boost_memories()` 对 existing expiry record 的 hard cap 应优先读取 record 自身的 `hard_expire_at`；只有 legacy record 没有该字段时，才回退到 `now + max_expiry_days` 的旧兜底计算。否则会把“已有绝对上限”弱化成“相对当前时间上限”。
