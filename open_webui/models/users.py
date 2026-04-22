@@ -3,9 +3,6 @@
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session
-
-
 class UserSettings(BaseModel):
     ui: dict[str, object] | None = {}
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
@@ -22,7 +19,9 @@ class UserModel(BaseModel):
 
 
 class UsersTable:
-    def get_user_by_id(self, id: str, db: Session | None = None) -> UserModel | None:
+    async def get_user_by_id(
+        self, id: str, db: object | None = None
+    ) -> UserModel | None:
         """Get user by ID."""
         _ = db
         return UserModel(

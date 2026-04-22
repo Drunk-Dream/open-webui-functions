@@ -3,9 +3,6 @@ from __future__ import annotations
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.orm import Session
-
-
 class ChatListResponse(BaseModel):
     items: list[object] = Field(default_factory=list)
     total: int = Field(default=0)
@@ -13,19 +10,19 @@ class ChatListResponse(BaseModel):
 
 
 class ChatTable:
-    def get_chats_by_user_id(
+    async def get_chats_by_user_id(
         self,
         user_id: str,
-        filter: dict | None = None,
+        filter: dict[str, object] | None = None,
         skip: int | None = None,
         limit: int | None = None,
-        db: Session | None = None,
+        db: object | None = None,
     ) -> ChatListResponse:
         _ = (filter, skip, limit, db)
         return ChatListResponse(items=[], total=0)
 
-    def delete_chat_by_id_and_user_id(
-        self, id: str, user_id: str, db: Session | None = None
+    async def delete_chat_by_id_and_user_id(
+        self, id: str, user_id: str, db: object | None = None
     ) -> bool:
         _ = (id, user_id, db)
         return True

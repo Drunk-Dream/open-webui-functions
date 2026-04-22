@@ -6,18 +6,19 @@ Provides has_permission for use in plugin tests.
 from typing import Any
 
 
-def has_permission(
+async def has_permission(
     user_id: str,
     permission_key: str,
-    default_permissions: dict[str, Any] = {},
+    default_permissions: dict[str, Any] | None = None,
     db: Any | None = None,
 ) -> bool:
-    def get_permission(permissions: dict[str, Any], keys: list) -> bool:
+    def get_permission(permissions: dict[str, Any], keys: list[str]) -> bool:
         for key in keys:
             if key not in permissions:
                 return False
             permissions = permissions[key]
         return bool(permissions)
 
+    _ = (user_id, db)
     keys = permission_key.split(".")
-    return get_permission(default_permissions, keys)
+    return get_permission(default_permissions or {}, keys)

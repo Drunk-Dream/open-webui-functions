@@ -1,7 +1,7 @@
 """Minimal Open WebUI internal.db module for testing."""
 
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncGenerator, Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -40,3 +40,20 @@ def get_db() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
+
+
+async def get_async_session() -> AsyncGenerator[Session, None]:
+    """Async session generator matching Open WebUI 0.9.x shape."""
+    with get_db() as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_async_db_context(db: Session | None = None):
+    """Async DB context manager matching Open WebUI 0.9.x shape."""
+    if db is not None:
+        yield db
+        return
+
+    with get_db() as session:
+        yield session
