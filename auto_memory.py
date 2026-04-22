@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.9
+version: 1.4.10
 required_open_webui_version: >= 0.8.1
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
@@ -15,6 +15,7 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
+- Version 1.4.10: Replaced remaining Chinese status text with English and refreshed the plugin version metadata
 - Version 1.4.9: Completed behavior-preserving single-file refactor, restored import-time lifecycle column bootstrap, and aligned hard-cap compatibility in boost semantics
 - Version 1.4.7: Optimized emit_status messages for mobile display by shortening each status text and splitting long updates into multiple emits
 - Version 1.4.6: Improved error handling - skip invalid tool calls instead of failing all operations
@@ -22,16 +23,6 @@ Compatibility Note:
 - Version 1.4.3: Refactored code structure for readability and maintainability.
 - Version 1.4.2: Split memory function calling into single-memory add/update/delete tools and initialize expiry immediately on add
 - Version 1.4.0: Refactored function calling implementation for improved reliability and maintainability
-- Version 1.3.7: Added ENABLE_MEMORIES global toggle and per-user features.memories permission checks
-- Version 1.3.6: Fixed memory expiry extension logic bug, added max_expiry_days parameter
-- Version 1.3.5: Compatible with Open WebUI 0.8.1+
-  Memory API signatures updated (db parameter removed from query/add/update operations)
-File Structure:
-    1. Module Header & Imports (L1-75)
-    2. System Prompts - Business Rules (L76-230)
-    3. Data Model Layer - Pydantic Models & Utilities (L231-405)
-    4. Infrastructure Layer - Async Tools & Database (L406-580)
-    5. Core Business Layer - Filter Class (L581-end)
 """
 
 # ============================================================================

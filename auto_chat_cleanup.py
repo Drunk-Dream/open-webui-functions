@@ -5,11 +5,12 @@ description: Automatically clean up old chats based on idle time and retention c
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.0.0
+version: 1.0.1
 required_open_webui_version: >= 0.8.1
 license: MIT
 
 Compatibility Note:
+- Version 1.0.1: Replaced the remaining Chinese cleanup status text with English and refreshed the plugin version metadata
 - Version 1.0.0: Initial release with OR-based cleanup rules (idle time OR retention count)
 
 Features:
