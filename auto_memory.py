@@ -38,6 +38,8 @@ File Structure:
 # 1. MODULE HEADER & IMPORTS
 # ============================================================================
 import asyncio
+from contextlib import asynccontextmanager, contextmanager
+import inspect as py_inspect
 import json
 import logging
 import threading
@@ -59,10 +61,11 @@ from typing import (
 from fastapi import HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
-from sqlalchemy import BigInteger, Boolean, Column, Float, Index, String, inspect, text
+from sqlalchemy import BigInteger, Boolean, Column, Float, Index, String, inspect as sa_inspect, text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 
-from open_webui.internal.db import Base, engine, get_db_context
+from open_webui.internal.db import Base, engine
 from open_webui.main import app as webui_app
 from open_webui.models.users import UserModel, Users
 from open_webui.retrieval.vector.main import SearchResult
@@ -76,6 +79,8 @@ from open_webui.routers.memories import (
     update_memory_by_id,
 )
 from open_webui.utils.access_control import has_permission
+
+inspect = sa_inspect
 
 # ============================================================================
 # 2. TYPE DEFINITIONS & CONSTANTS
@@ -652,6 +657,49 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
 T = TypeVar("T")
 
 
+async def _await_if_needed(value: T | Awaitable[T]) -> T:
+    if py_inspect.isawaitable(value):
+        return await cast(Awaitable[T], value)
+    return cast(T, value)
+
+
+@asynccontextmanager
+async def _get_open_webui_db_context():
+    try:
+        from open_webui.internal.db import get_async_db_context
+    except ImportError:
+        session_factory = sessionmaker(bind=engine)
+        session = session_factory()
+        try:
+            yield session
+        finally:
+            session.close()
+    else:
+        async with get_async_db_context() as db:
+            yield db
+
+
+def get_db_context(db: Session | None = None):
+    try:
+        from open_webui.internal.db import get_db_context as open_webui_get_db_context
+    except ImportError:
+        @contextmanager
+        def _fallback_get_db_context():
+            if db is not None:
+                yield db
+                return
+
+            session_factory = sessionmaker(bind=engine)
+            session = session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        return _fallback_get_db_context()
+    return open_webui_get_db_context(db)
+
+
 def _run_coro_in_new_loop(coro: Awaitable[T]) -> T:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -886,7 +934,7 @@ def _ensure_lifecycle_columns() -> bool:
     logger = logging.getLogger(__name__)
     try:
         with engine.begin() as connection:
-            inspector = inspect(connection)
+            inspector = sa_inspect(connection)
             existing_columns = {
                 column["name"]
                 for column in inspector.get_columns(MemoryExpiry.__tablename__)
@@ -1275,17 +1323,30 @@ class Filter:
 
     def _delete_memory_sync(self, mem_id: str, user: UserModel) -> None:
         """Synchronous helper for deleting memory in thread pool."""
-        from open_webui.internal.db import get_db
+        _run_coro_in_new_loop(self._delete_memory_by_id(mem_id=mem_id, user=user))
 
-        with get_db() as db:
-            _run_coro_in_new_loop(
-                delete_memory_by_id(
-                    memory_id=mem_id,
-                    request=_build_webui_request(),
-                    user=user,
-                    db=db,
+    async def _delete_memory_by_id(self, mem_id: str, user: UserModel) -> None:
+        async with _get_open_webui_db_context() as db:
+            await delete_memory_by_id(
+                memory_id=mem_id,
+                request=_build_webui_request(),
+                user=user,
+                db=db,
+            )
+
+    async def _get_user_by_id(self, user_id: str) -> UserModel | None:
+        return await _await_if_needed(Users.get_user_by_id(user_id))
+
+    async def _has_memories_permission(self, user_id: str) -> bool:
+        return bool(
+            await _await_if_needed(
+                has_permission(
+                    user_id,
+                    "features.memories",
+                    getattr(webui_app.state.config, "USER_PERMISSIONS", {}),
                 )
             )
+        )
 
     # ------------------------------------------------------------------------
     # Memory CRUD Operations (Private)
@@ -1353,6 +1414,15 @@ class Filter:
             level="debug",
         )
 
+    async def _resolve_outlet_user_async(self, __user__: dict[str, object]) -> UserModel:
+        user = await self._get_user_by_id(str(__user__["id"]))
+        if user is None:
+            raise ValueError("user not found")
+        return user
+
+    async def _user_has_memories_permission_async(self, user: UserModel) -> bool:
+        return await self._has_memories_permission(user.id)
+
     async def _delete_memory_with_db(
         self, action: MemoryDeleteAction, user: UserModel
     ) -> None:
@@ -1362,15 +1432,10 @@ class Filter:
             action: Delete action containing memory ID
             user: User performing the deletion
         """
-        from open_webui.internal.db import get_db
-
-        with get_db() as db:
-            await delete_memory_by_id(
-                memory_id=action.id,
-                request=_build_webui_request(),
-                user=user,
-                db=db,
-            )
+        await self._delete_memory_by_id(
+            mem_id=action.id,
+            user=user,
+        )
 
     async def _add_memory_with_expiry(
         self, action: MemoryAddAction, user: UserModel
@@ -2331,7 +2396,7 @@ class Filter:
             )
             return None
 
-        user = Users.get_user_by_id(user_id)
+        user = _run_async_in_thread(self._get_user_by_id(user_id))
         if user is None:
             self.log("inlet context injection skipped: user not found", level="warning")
             return None
@@ -2426,19 +2491,8 @@ class Filter:
             isinstance(chat_id, str) and chat_id.startswith("local:")
         )
 
-    def _resolve_outlet_user(self, __user__: dict[str, object]) -> UserModel:
-        user = Users.get_user_by_id(str(__user__["id"]))
-        if user is None:
-            raise ValueError("user not found")
-        return user
-
     def _memories_globally_enabled(self) -> bool:
-        return bool(webui_app.state.config.ENABLE_MEMORIES)
-
-    def _user_has_memories_permission(self, user: UserModel) -> bool:
-        return has_permission(
-            user.id, "features.memories", webui_app.state.config.USER_PERMISSIONS
-        )
+        return bool(getattr(webui_app.state.config, "ENABLE_MEMORIES", False))
 
     def _memory_enabled_in_user_settings(self, user: UserModel) -> bool:
         return not (
@@ -2483,7 +2537,7 @@ class Filter:
             self.log("temporary chat, skipping", level="info")
             return body
 
-        user = self._resolve_outlet_user(__user__)
+        user = await self._resolve_outlet_user_async(__user__)
 
         # Check global memories toggle (upstream: ENABLE_MEMORIES config flag)
         if not self._memories_globally_enabled():
@@ -2494,7 +2548,7 @@ class Filter:
             return body
 
         # Check per-user memories permission (upstream: features.memories permission)
-        if not self._user_has_memories_permission(user):
+        if not await self._user_has_memories_permission_async(user):
             self.log(
                 f"user {user.id} does not have 'features.memories' permission, skipping",
                 level="info",

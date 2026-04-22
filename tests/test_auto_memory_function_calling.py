@@ -778,6 +778,29 @@ def test_inlet_injects_with_single_user_message(mock_emitter):
     assert messages[1] == {"role": "user", "content": "test"}
 
 
+def test_inlet_supports_async_user_lookup(mock_emitter):
+    filter_instance = Filter()
+    body = cast(dict[str, object], {"messages": [{"role": "user", "content": "test"}]})
+
+    async def mock_get_user(_user_id: str):
+        return MagicMock(id="user-1")
+
+    with (
+        patch("auto_memory.Users.get_user_by_id", new=mock_get_user),
+        patch(
+            "auto_memory._run_async_in_thread",
+            side_effect=lambda coro: (coro.close(), [])[1],
+        ),
+    ):
+        updated = filter_instance.inlet(
+            body=body,
+            __event_emitter__=mock_emitter,
+            __user__={"id": "user-1"},
+        )
+
+    assert updated is body
+
+
 def test_inject_memory_context_replaces_previous_memory_block():
     filter_instance = Filter()
     messages = [
