@@ -59,7 +59,7 @@ from typing import (
 from fastapi import HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
-from sqlalchemy import BigInteger, Column, Index, String, inspect, text
+from sqlalchemy import BigInteger, Boolean, Column, Float, Index, String, inspect, text
 from sqlalchemy.orm import Session
 
 from open_webui.internal.db import Base, engine, get_db_context
@@ -82,14 +82,119 @@ from open_webui.utils.access_control import has_permission
 # ============================================================================
 LogLevel = Literal["debug", "info", "warning", "error"]
 
-# Type aliases for better readability
 EmitterType = Callable[[dict[str, Any]], Awaitable[None]]
 
-# Configuration constants
 SECONDS_PER_DAY = 86400
+SECONDS_PER_MINUTE = 60
 SHORT_MESSAGE_WORD_THRESHOLD = 8
 MAX_MEMORY_IDS_FOR_TOOLS = 50
 SIMILARITY_SCORE_PRECISION = 3
+MAX_LIFETIME_DAYS = 90
+INITIAL_STRENGTH = 40
+BASE_DECAY_PER_DAY = 1.0
+ACCESS_GAIN = 12
+GAIN_DAMPING = 0.15
+BURST_WINDOW_MINUTES = 30
+BURST_GAIN_MULTIPLIER = 0.25
+FORGET_THRESHOLD = 15
+DELETE_GRACE_DAYS = 7
+MAINTENANCE_BATCH_SIZE = 20
+MAX_WRITES_PER_EVENT = 50
+CLEANUP_DELETE_AFTER_FAILURES = 3
+LIFECYCLE_DEFAULTS: dict[str, Any] = {
+    "hard_expire_at": None,
+    "access_count": 0,
+    "last_accessed_at": None,
+    "last_decay_at": None,
+    "strength": INITIAL_STRENGTH,
+    "pinned": False,
+    "cleanup_fail_count": 0,
+}
+
+LIFECYCLE_COLUMN_TYPES: dict[str, str] = {
+    "hard_expire_at": "BIGINT",
+    "access_count": "BIGINT",
+    "last_accessed_at": "BIGINT",
+    "last_decay_at": "BIGINT",
+    "strength": "FLOAT",
+    "pinned": "BOOLEAN",
+    "cleanup_fail_count": "BIGINT",
+}
+
+LIFECYCLE_BACKFILL_STATEMENTS: dict[str, str] = {
+    "hard_expire_at": f"UPDATE auto_memory_expiry SET hard_expire_at = created_at + {MAX_LIFETIME_DAYS * SECONDS_PER_DAY} WHERE hard_expire_at IS NULL",
+    "access_count": "UPDATE auto_memory_expiry SET access_count = 0 WHERE access_count IS NULL",
+    "last_accessed_at": "UPDATE auto_memory_expiry SET last_accessed_at = updated_at WHERE last_accessed_at IS NULL",
+    "last_decay_at": "UPDATE auto_memory_expiry SET last_decay_at = updated_at WHERE last_decay_at IS NULL",
+    "strength": f"UPDATE auto_memory_expiry SET strength = {INITIAL_STRENGTH} WHERE strength IS NULL",
+    "pinned": "UPDATE auto_memory_expiry SET pinned = 0 WHERE pinned IS NULL",
+    "cleanup_fail_count": "UPDATE auto_memory_expiry SET cleanup_fail_count = 0 WHERE cleanup_fail_count IS NULL",
+}
+
+
+def _calculate_hard_expire_at(created_at_timestamp: int) -> int:
+    return created_at_timestamp + (MAX_LIFETIME_DAYS * SECONDS_PER_DAY)
+
+
+def _calculate_decayed_strength(
+    current_strength: float,
+    last_decay_at: int,
+    now_timestamp: int,
+) -> float:
+    elapsed_seconds = max(0, now_timestamp - last_decay_at)
+    elapsed_days = elapsed_seconds / SECONDS_PER_DAY
+    return max(0.0, current_strength - (elapsed_days * BASE_DECAY_PER_DAY))
+
+
+def _calculate_reinforcement_gain(access_count: int) -> float:
+    normalized_access_count = max(0, access_count)
+    return ACCESS_GAIN / (1 + (normalized_access_count * GAIN_DAMPING))
+
+
+def _calculate_burst_multiplier(
+    last_accessed_at: int | None,
+    now_timestamp: int,
+) -> float:
+    if last_accessed_at is None:
+        return 1.0
+
+    if now_timestamp - last_accessed_at <= BURST_WINDOW_MINUTES * SECONDS_PER_MINUTE:
+        return BURST_GAIN_MULTIPLIER
+
+    return 1.0
+
+
+def _calculate_soft_expire_at(
+    strength: float,
+    now_timestamp: int,
+    hard_expire_at: int,
+) -> int:
+    soft_window_days = max(1, round(max(0.0, strength) / 10))
+    return min(now_timestamp + (soft_window_days * SECONDS_PER_DAY), hard_expire_at)
+
+
+def _should_delete_maintenance_candidate(record: Any, now_timestamp: int) -> bool:
+    hard_expire_at = int(getattr(record, "hard_expire_at", 0) or 0)
+    expired_at = int(getattr(record, "expired_at", 0) or 0)
+    strength = float(getattr(record, "strength", 0.0) or 0.0)
+    cleanup_fail_count = int(getattr(record, "cleanup_fail_count", 0) or 0)
+
+    if hard_expire_at and hard_expire_at <= now_timestamp:
+        return True
+
+    if expired_at > now_timestamp:
+        return False
+
+    if cleanup_fail_count >= CLEANUP_DELETE_AFTER_FAILURES:
+        return True
+
+    if strength <= FORGET_THRESHOLD:
+        return True
+
+    return expired_at + (DELETE_GRACE_DAYS * SECONDS_PER_DAY) <= now_timestamp
+
+
+_lifecycle_bootstrap_ready = False
 
 STRINGIFIED_MESSAGE_TEMPLATE = "-{index}. {role}: ```{content}```"
 INLET_MEMORY_CONTEXT_PREFIX = "[AUTO_MEMORY_RELATED_MEMORIES]"
@@ -472,6 +577,19 @@ def _parse_memory_action_tool_call(
     return _build_memory_action_from_parsed_args(tool_name, parsed_args)
 
 
+def _get_timestamp_field(source: Any, *field_names: str) -> Any | None:
+    for field_name in field_names:
+        if isinstance(source, dict):
+            value = source.get(field_name)
+        else:
+            value = getattr(source, field_name, None)
+
+        if value is not None:
+            return value
+
+    return None
+
+
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
     memories = []
 
@@ -488,18 +606,27 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
         ):
             if not meta:
                 raise ValueError(f"Missing metadata for memory id={mem_id}")
-            if "created_at" not in meta:
+            created_at_value = _get_timestamp_field(meta, "created_at")
+            if created_at_value is None:
                 raise ValueError(
                     f"Missing 'created_at' in metadata for memory id={mem_id}"
                 )
-            if "updated_at" not in meta:
-                # If updated_at is missing, default to created_at
-                meta["updated_at"] = meta["created_at"]
 
-            created_at = datetime.fromtimestamp(meta["created_at"])
-            updated_at = datetime.fromtimestamp(meta["updated_at"])
+            updated_at_value = _get_timestamp_field(
+                meta,
+                "updated_at",
+                "update_at",
+            )
 
-            # Extract similarity score if available
+            created_at = datetime.fromtimestamp(int(created_at_value))
+            updated_at = datetime.fromtimestamp(
+                int(
+                    updated_at_value
+                    if updated_at_value is not None
+                    else created_at_value
+                )
+            )
+
             similarity_score = None
             if distances_batch is not None and doc_idx < len(distances_batch):
                 similarity_score = round(
@@ -586,6 +713,13 @@ class MemoryExpiry(Base):
     expired_at = Column(BigInteger, nullable=False, index=True)
     created_at = Column(BigInteger, nullable=False)
     updated_at = Column(BigInteger, nullable=False)
+    hard_expire_at = Column(BigInteger, nullable=False, index=True)
+    access_count = Column(BigInteger, nullable=False)
+    last_accessed_at = Column(BigInteger, nullable=False)
+    last_decay_at = Column(BigInteger, nullable=False)
+    strength = Column(Float, nullable=False)
+    pinned = Column(Boolean, nullable=False)
+    cleanup_fail_count = Column(BigInteger, nullable=False)
 
     __table_args__ = (
         Index("ix_auto_memory_expiry_user_expired", "user_id", "expired_at"),
@@ -601,17 +735,33 @@ class MemoryExpiryTable:
         mem_id: str,
         user_id: str,
         expired_at: int,
+        created_at: int | None = None,
+        hard_expire_at: int | None = None,
+        access_count: int = 0,
+        last_accessed_at: int | None = None,
+        last_decay_at: int | None = None,
+        strength: float = INITIAL_STRENGTH,
+        cleanup_fail_count: int = 0,
         db: Optional[Session] = None,
     ) -> Optional[MemoryExpiry]:
         """Insert a new memory expiry record."""
         with get_db_context(db) as db:
             now = int(time.time())
+            created_at_value = created_at or now
             expiry = MemoryExpiry(
                 mem_id=mem_id,
                 user_id=user_id,
                 expired_at=expired_at,
-                created_at=now,
+                created_at=created_at_value,
                 updated_at=now,
+                hard_expire_at=hard_expire_at
+                or _calculate_hard_expire_at(created_at_value),
+                access_count=access_count,
+                last_accessed_at=last_accessed_at or now,
+                last_decay_at=last_decay_at or now,
+                strength=strength,
+                pinned=False,
+                cleanup_fail_count=cleanup_fail_count,
             )
             db.add(expiry)
             db.commit()
@@ -631,14 +781,34 @@ class MemoryExpiryTable:
         self,
         mem_id: str,
         expired_at: int,
+        created_at: int | None = None,
+        hard_expire_at: int | None = None,
+        strength: float | None = None,
+        access_count: int | None = None,
+        last_accessed_at: int | None = None,
+        last_decay_at: int | None = None,
+        cleanup_fail_count: int | None = None,
         db: Optional[Session] = None,
     ) -> Optional[MemoryExpiry]:
-        """Update the expiration time for a memory."""
         with get_db_context(db) as db:
             expiry = db.get(MemoryExpiry, mem_id)
             if not expiry:
                 return None
             expiry.expired_at = expired_at  # pyright: ignore
+            if created_at is not None:
+                expiry.created_at = created_at  # pyright: ignore
+            if hard_expire_at is not None:
+                expiry.hard_expire_at = hard_expire_at  # pyright: ignore
+            if strength is not None:
+                expiry.strength = strength  # pyright: ignore
+            if access_count is not None:
+                expiry.access_count = access_count  # pyright: ignore
+            if last_accessed_at is not None:
+                expiry.last_accessed_at = last_accessed_at  # pyright: ignore
+            if last_decay_at is not None:
+                expiry.last_decay_at = last_decay_at  # pyright: ignore
+            if cleanup_fail_count is not None:
+                expiry.cleanup_fail_count = cleanup_fail_count  # pyright: ignore
             expiry.updated_at = int(time.time())  # pyright: ignore[reportAttributeAccessIssue]
             db.commit()
             db.refresh(expiry)
@@ -662,16 +832,32 @@ class MemoryExpiryTable:
         self,
         user_id: str,
         now_timestamp: int,
+        limit: int = MAINTENANCE_BATCH_SIZE,
         db: Optional[Session] = None,
     ) -> list[MemoryExpiry]:
-        """Get all expired memories for a user."""
         with get_db_context(db) as db:
             return (
                 db.query(MemoryExpiry)
                 .filter(
                     MemoryExpiry.user_id == user_id,
-                    MemoryExpiry.expired_at < now_timestamp,
+                    MemoryExpiry.pinned.is_(False),
+                    (
+                        (MemoryExpiry.hard_expire_at <= now_timestamp)
+                        | (MemoryExpiry.expired_at <= now_timestamp)
+                        | (MemoryExpiry.strength <= FORGET_THRESHOLD)
+                        | (
+                            MemoryExpiry.cleanup_fail_count
+                            >= CLEANUP_DELETE_AFTER_FAILURES
+                        )
+                    ),
                 )
+                .order_by(
+                    MemoryExpiry.hard_expire_at.asc(),
+                    MemoryExpiry.expired_at.asc(),
+                    MemoryExpiry.last_accessed_at.asc(),
+                    MemoryExpiry.mem_id.asc(),
+                )
+                .limit(limit)
                 .all()
             )
 
@@ -680,7 +866,7 @@ MemoryExpiries = MemoryExpiryTable()
 
 
 # --- Database Initialization ---
-def _ensure_table_exists():
+def _ensure_table_exists() -> bool:
     """Ensure MemoryExpiry table exists in database."""
     try:
         Base.metadata.create_all(
@@ -688,28 +874,16 @@ def _ensure_table_exists():
             tables=[MemoryExpiry.__table__],  # pyright: ignore[reportArgumentType]
             checkfirst=True,
         )
+        return True
     except Exception:
-        pass
+        logging.getLogger(__name__).exception(
+            "failed to create auto_memory_expiry table"
+        )
+        return False
 
 
-def _ensure_lifecycle_columns() -> None:
-    lifecycle_columns = {
-        "hard_expire_at": "BIGINT",
-        "access_count": "BIGINT",
-        "last_accessed_at": "BIGINT",
-        "last_decay_at": "BIGINT",
-        "strength": "FLOAT",
-        "pinned": "BOOLEAN",
-    }
-    backfill_statements = {
-        "hard_expire_at": "UPDATE auto_memory_expiry SET hard_expire_at = expired_at WHERE hard_expire_at IS NULL",
-        "access_count": "UPDATE auto_memory_expiry SET access_count = 0 WHERE access_count IS NULL",
-        "last_accessed_at": "UPDATE auto_memory_expiry SET last_accessed_at = updated_at WHERE last_accessed_at IS NULL",
-        "last_decay_at": "UPDATE auto_memory_expiry SET last_decay_at = updated_at WHERE last_decay_at IS NULL",
-        "strength": "UPDATE auto_memory_expiry SET strength = 100.0 WHERE strength IS NULL",
-        "pinned": "UPDATE auto_memory_expiry SET pinned = 0 WHERE pinned IS NULL",
-    }
-
+def _ensure_lifecycle_columns() -> bool:
+    logger = logging.getLogger(__name__)
     try:
         with engine.begin() as connection:
             inspector = inspect(connection)
@@ -718,7 +892,7 @@ def _ensure_lifecycle_columns() -> None:
                 for column in inspector.get_columns(MemoryExpiry.__tablename__)
             }
 
-            for column_name, column_type in lifecycle_columns.items():
+            for column_name, column_type in LIFECYCLE_COLUMN_TYPES.items():
                 if column_name not in existing_columns:
                     connection.execute(
                         text(
@@ -726,14 +900,50 @@ def _ensure_lifecycle_columns() -> None:
                             f"ADD COLUMN {column_name} {column_type}"
                         )
                     )
+                    logger.info(
+                        "added missing lifecycle column %s to auto_memory_expiry",
+                        column_name,
+                    )
 
-                connection.execute(text(backfill_statements[column_name]))
+                repair_result = connection.execute(
+                    text(LIFECYCLE_BACKFILL_STATEMENTS[column_name])
+                )
+                logger.debug(
+                    "backfilled lifecycle column %s on auto_memory_expiry (rowcount=%s)",
+                    column_name,
+                    getattr(repair_result, "rowcount", None),
+                )
+        return True
     except Exception:
-        pass
+        logger.exception("failed to ensure lifecycle columns on auto_memory_expiry")
+        return False
 
 
-_ensure_table_exists()
-_ensure_lifecycle_columns()
+def _ensure_memory_expiry_lifecycle_bootstrap() -> bool:
+    global _lifecycle_bootstrap_ready
+
+    if _lifecycle_bootstrap_ready:
+        return True
+
+    table_ready = _ensure_table_exists()
+    columns_ready = _ensure_lifecycle_columns()
+    _lifecycle_bootstrap_ready = table_ready and columns_ready
+    return _lifecycle_bootstrap_ready
+
+
+def _get_lifecycle_value(record: Any, field_name: str) -> Any:
+    value = getattr(record, field_name, None)
+    if value is None:
+        return LIFECYCLE_DEFAULTS[field_name]
+    return value
+
+
+def _get_lifecycle_int(record: Any, field_name: str) -> int | None:
+    value = _get_lifecycle_value(record, field_name)
+    return None if value is None else int(value)
+
+
+_ensure_memory_expiry_lifecycle_bootstrap()
 
 
 R = TypeVar("R", bound=BaseModel)
@@ -807,23 +1017,6 @@ class Filter:
         debug_mode: bool = Field(
             default=False,
             description="enable debug logging",
-        )
-
-        # ===== Memory Expiry Configuration =====
-        initial_expiry_days: int = Field(
-            default=30,
-            ge=1,
-            description="initial expiry time for new memories (days). memories will expire after this many days if not accessed.",
-        )
-        extension_days: int = Field(
-            default=14,
-            ge=1,
-            description="extension time when memory is accessed (days). accessed memories will have their expiry extended by this many days.",
-        )
-        max_expiry_days: int = Field(
-            default=365,
-            ge=1,
-            description="maximum expiry time for memories (days). prevents memories from being extended indefinitely. accessed memories will not exceed this limit from current time.",
         )
 
     class UserValves(BaseModel):
@@ -1122,18 +1315,24 @@ class Filter:
         return None
 
     def _initialize_memory_expiry(self, mem_id: str, user_id: str) -> None:
-        """Initialize expiry record for new memory.
-
-        Args:
-            mem_id: Memory ID to initialize expiry for
-            user_id: User ID who owns the memory
-        """
-        expired_at = self._calculate_initial_expired_at(int(time.time()))
+        now_timestamp = int(time.time())
+        expired_at = self._calculate_initial_expired_at(now_timestamp)
+        hard_expire_at = _calculate_hard_expire_at(now_timestamp)
         existing = MemoryExpiries.get_by_mem_id(mem_id)
         if existing:
-            MemoryExpiries.update_expired_at(mem_id, expired_at)
+            MemoryExpiries.update_expired_at(
+                mem_id,
+                expired_at,
+                created_at=now_timestamp,
+                hard_expire_at=hard_expire_at,
+                access_count=0,
+                last_accessed_at=now_timestamp,
+                last_decay_at=now_timestamp,
+                strength=INITIAL_STRENGTH,
+                cleanup_fail_count=0,
+            )
             self.log(
-                f"reset expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+                f"reset lifecycle tracking for memory {mem_id[:8]}...",
                 level="debug",
             )
             return
@@ -1141,9 +1340,16 @@ class Filter:
             mem_id=mem_id,
             user_id=user_id,
             expired_at=expired_at,
+            created_at=now_timestamp,
+            hard_expire_at=hard_expire_at,
+            access_count=0,
+            last_accessed_at=now_timestamp,
+            last_decay_at=now_timestamp,
+            strength=INITIAL_STRENGTH,
+            cleanup_fail_count=0,
         )
         self.log(
-            f"initialized expiry for new memory {mem_id[:8]}... to {self.valves.initial_expiry_days} days",
+            f"initialized lifecycle tracking for memory {mem_id[:8]}...",
             level="debug",
         )
 
@@ -1513,25 +1719,82 @@ class Filter:
         return insert_at
 
     def _calculate_initial_expired_at(self, now_timestamp: int) -> int:
-        return now_timestamp + (self.valves.initial_expiry_days * SECONDS_PER_DAY)
+        return _calculate_soft_expire_at(
+            strength=INITIAL_STRENGTH,
+            now_timestamp=now_timestamp,
+            hard_expire_at=_calculate_hard_expire_at(now_timestamp),
+        )
 
     def _calculate_boosted_expired_at(
         self,
-        existing_expired_at: int,
+        existing_record: Any,
         now_timestamp: int,
-        hard_expire_at: int | None = None,
-    ) -> int:
-        extension_seconds = self.valves.extension_days * SECONDS_PER_DAY
-        max_expiry_seconds = self.valves.max_expiry_days * SECONDS_PER_DAY
-        extended_from_existing = existing_expired_at + extension_seconds
-        extended_from_now = now_timestamp + extension_seconds
-        extended_expired_at = max(extended_from_existing, extended_from_now)
-        max_allowed_expired_at = (
-            hard_expire_at
-            if hard_expire_at is not None
-            else now_timestamp + max_expiry_seconds
+    ) -> dict[str, float | int]:
+        created_at = _get_lifecycle_int(existing_record, "created_at") or now_timestamp
+        hard_expire_at = _get_lifecycle_int(existing_record, "hard_expire_at")
+        access_count = _get_lifecycle_int(existing_record, "access_count") or 0
+        last_decay_at = (
+            _get_lifecycle_int(existing_record, "last_decay_at") or now_timestamp
         )
-        return min(extended_expired_at, max_allowed_expired_at)
+        last_accessed_at = _get_lifecycle_int(existing_record, "last_accessed_at")
+        current_strength = float(_get_lifecycle_value(existing_record, "strength"))
+        decayed_strength = _calculate_decayed_strength(
+            current_strength=current_strength,
+            last_decay_at=last_decay_at,
+            now_timestamp=now_timestamp,
+        )
+        gain = _calculate_reinforcement_gain(access_count)
+        burst_multiplier = _calculate_burst_multiplier(last_accessed_at, now_timestamp)
+        new_strength = min(100.0, decayed_strength + (gain * burst_multiplier))
+        resolved_hard_expire_at = hard_expire_at or _calculate_hard_expire_at(
+            created_at
+        )
+        return {
+            "hard_expire_at": resolved_hard_expire_at,
+            "expired_at": _calculate_soft_expire_at(
+                strength=new_strength,
+                now_timestamp=now_timestamp,
+                hard_expire_at=resolved_hard_expire_at,
+            ),
+            "strength": new_strength,
+            "access_count": access_count + 1,
+            "last_accessed_at": now_timestamp,
+            "last_decay_at": now_timestamp,
+            "cleanup_fail_count": 0,
+        }
+
+    def _build_memory_maintenance_candidates(
+        self,
+        user_id: str,
+        now_timestamp: int,
+        limit: int = MAINTENANCE_BATCH_SIZE,
+    ) -> list[MemoryExpiry]:
+        return MemoryExpiries.get_expired(
+            user_id=user_id,
+            now_timestamp=now_timestamp,
+            limit=limit,
+        )
+
+    def _advance_cleanup_tracking(
+        self,
+        mem_id: str,
+        expiry_table: MemoryExpiryTable,
+    ) -> bool:
+        existing = expiry_table.get_by_mem_id(mem_id)
+        if existing is None:
+            return False
+
+        next_fail_count = int(getattr(existing, "cleanup_fail_count", 0) or 0) + 1
+        if next_fail_count >= CLEANUP_DELETE_AFTER_FAILURES:
+            expiry_table.delete_by_mem_id(mem_id)
+            return True
+
+        expiry_table.update_expired_at(
+            mem_id,
+            int(getattr(existing, "expired_at", 0) or 0),
+            cleanup_fail_count=next_fail_count,
+        )
+        return False
 
     async def _cleanup_expired_memory_record(
         self,
@@ -1555,6 +1818,18 @@ class Filter:
                 f"Memory may have been manually deleted. Continuing to clean up expiry record.",
                 level="warning",
             )
+            removed = self._advance_cleanup_tracking(mem_id, expiry_table)
+            if removed:
+                self.log(
+                    f"removed expiry record after cleanup failures: {mem_id[:8]}...",
+                    level="warning",
+                )
+                return True
+            self.log(
+                f"retained expiry record after cleanup failure: {mem_id[:8]}...",
+                level="warning",
+            )
+            return False
 
         try:
             expiry_table.delete_by_mem_id(mem_id)
@@ -1575,11 +1850,14 @@ class Filter:
         user: UserModel,
     ) -> int:
         """
-        Delete expired memories from both vector database and expiry table.
+        Process one small maintenance batch of cleanup-needed lifecycle rows.
 
-        Queries the MemoryExpiryTable for records where expired_at < now,
-        then deletes each expired memory from the vector database and
-        removes the corresponding expiry record.
+        Candidate selection stays batched via `MemoryExpiryTable.get_expired(...)`
+        and `MAINTENANCE_BATCH_SIZE`. Each candidate is then evaluated against the
+        lifecycle rules: immediate removal for hard expiry, terminal retry count,
+        forgotten strength, or soft-expired rows that have exceeded the grace window.
+        This maintenance pass runs before memory planning so overdue rows do not leak
+        into the subsequent planning/action stage.
 
         Args:
             user: User model for ownership verification
@@ -1587,20 +1865,28 @@ class Filter:
         Returns:
             Number of memories cleaned up
         """
+        _ensure_memory_expiry_lifecycle_bootstrap()
         now_timestamp = int(time.time())
         expiry_table = MemoryExpiries
 
-        # Get expired records
-        expired_records = expiry_table.get_expired(user.id, now_timestamp)
+        expired_records = self._build_memory_maintenance_candidates(
+            user_id=user.id,
+            now_timestamp=now_timestamp,
+            limit=MAINTENANCE_BATCH_SIZE,
+        )
 
         if not expired_records:
-            self.log("no expired memories found", level="debug")
+            self.log("no memory maintenance candidates found", level="debug")
             return 0
 
-        self.log(f"found {len(expired_records)} expired memories", level="info")
+        self.log(
+            f"found {len(expired_records)} memory maintenance candidates", level="info"
+        )
 
         deleted_count = 0
         for record in expired_records:
+            if not _should_delete_maintenance_candidate(record, now_timestamp):
+                continue
             if await self._cleanup_expired_memory_record(
                 mem_id=str(record.mem_id),
                 user=user,
@@ -1621,14 +1907,16 @@ class Filter:
         user: UserModel,
     ) -> dict[str, int]:
         """
-        Boost (extend expiry time) for retrieved memories.
+        Apply lifecycle updates to the current related-memory hits.
 
-        For each memory in related_memories:
-        - If expiry record exists:
-          * Extend expired_at by extension_days from existing expiry
-          * Ensure at least extension_days from now (handles already-expired memories)
-          * Cap at max_expiry_days from now
-        - If expiry record doesn't exist: create new record with expired_at = now + initial_expiry_days
+        Each hit goes through the same three-layer lifecycle model:
+        - keep `hard_expire_at` frozen from the original creation time,
+        - decay strength from `last_decay_at` to now,
+        - reinforce the decayed strength for the current access,
+        - derive a fresh soft `expired_at` window from the new strength.
+
+        Missing lifecycle rows are reconstructed from the memory's original
+        `created_at`, with the same immutable hard-expiry boundary.
 
         Args:
             related_memories: List of Memory objects that were retrieved
@@ -1640,51 +1928,67 @@ class Filter:
         if not related_memories:
             return {"total": 0, "boosted": 0, "created": 0}
 
+        _ensure_memory_expiry_lifecycle_bootstrap()
         now_timestamp = int(time.time())
         expiry_table = MemoryExpiries
 
-        stats = {"total": len(related_memories), "boosted": 0, "created": 0}
+        limited_memories = related_memories[:MAX_WRITES_PER_EVENT]
+        stats = {"total": len(limited_memories), "boosted": 0, "created": 0}
 
-        self.log(f"boosting {len(related_memories)} retrieved memories", level="debug")
+        self.log(f"boosting {len(limited_memories)} retrieved memories", level="debug")
 
-        for memory in related_memories:
+        for memory in limited_memories:
             try:
                 existing = expiry_table.get_by_mem_id(memory.mem_id)
 
                 if existing:
                     previous_expired_at = int(existing.expired_at)  # pyright: ignore[reportArgumentType]
-                    existing_hard_expire_at = getattr(existing, "hard_expire_at", None)
-                    new_expired_at = self._calculate_boosted_expired_at(
-                        existing_expired_at=previous_expired_at,
+                    new_lifecycle = self._calculate_boosted_expired_at(
+                        existing_record=existing,
                         now_timestamp=now_timestamp,
-                        hard_expire_at=(
-                            int(existing_hard_expire_at)
-                            if existing_hard_expire_at is not None
-                            else None
-                        ),
                     )
 
-                    expiry_table.update_expired_at(memory.mem_id, new_expired_at)
+                    expiry_table.update_expired_at(
+                        memory.mem_id,
+                        int(new_lifecycle["expired_at"]),
+                        strength=float(new_lifecycle["strength"]),
+                        access_count=int(new_lifecycle["access_count"]),
+                        last_accessed_at=int(new_lifecycle["last_accessed_at"]),
+                        last_decay_at=int(new_lifecycle["last_decay_at"]),
+                        cleanup_fail_count=int(new_lifecycle["cleanup_fail_count"]),
+                    )
                     stats["boosted"] += 1
 
                     days_extended = (
-                        new_expired_at - previous_expired_at
+                        int(new_lifecycle["expired_at"]) - previous_expired_at
                     ) / SECONDS_PER_DAY
                     self.log(
-                        f"boosted memory {memory.mem_id[:8]}... expiry extended by {days_extended:.1f} days "
-                        f"(requested {self.valves.extension_days}, capped at {self.valves.max_expiry_days} days from now)",
+                        f"boosted memory {memory.mem_id[:8]}... expiry shifted by {days_extended:.1f} days while keeping hard expiry fixed",
                         level="debug",
                     )
                 else:
-                    new_expired_at = self._calculate_initial_expired_at(now_timestamp)
+                    created_at_timestamp = int(memory.created_at.timestamp())
+                    hard_expire_at = _calculate_hard_expire_at(created_at_timestamp)
+                    new_expired_at = _calculate_soft_expire_at(
+                        strength=INITIAL_STRENGTH,
+                        now_timestamp=now_timestamp,
+                        hard_expire_at=hard_expire_at,
+                    )
                     expiry_table.insert(
                         mem_id=memory.mem_id,
                         user_id=user.id,
                         expired_at=new_expired_at,
+                        created_at=created_at_timestamp,
+                        hard_expire_at=hard_expire_at,
+                        access_count=1,
+                        last_accessed_at=now_timestamp,
+                        last_decay_at=now_timestamp,
+                        strength=INITIAL_STRENGTH,
+                        cleanup_fail_count=0,
                     )
                     stats["created"] += 1
                     self.log(
-                        f"created expiry for memory {memory.mem_id[:8]}... expires in {self.valves.initial_expiry_days} days",
+                        f"created lifecycle for memory {memory.mem_id[:8]}... with frozen hard expiry",
                         level="debug",
                     )
 
@@ -1800,15 +2104,12 @@ class Filter:
             return
         self.log(f"flow started. user ID: {user.id}", level="debug")
 
-        # === Get Related Memories ===
         related_memories = await self.get_related_memories(messages=messages, user=user)
 
-        # === Boost Retrieved Memories (extend expiry) ===
         boost_stats = {"boosted": 0, "created": 0}
         if related_memories:
             boost_stats = await self.boost_memories(related_memories, user)
 
-        # === Cleanup Expired Memories ===
         deleted_count = await self.cleanup_expired_memories(user)
         await self._emit_memory_lifecycle_statuses(
             boost_stats=boost_stats,
@@ -1927,8 +2228,27 @@ class Filter:
     ) -> bool:
         if action_name == "delete":
             delete_action = cast(MemoryDeleteAction, action)
-            await self._delete_memory_with_db(delete_action, user)
+            try:
+                await self._delete_memory_with_db(delete_action, user)
+            except Exception as e:
+                self.log(
+                    f"failed to delete memory. id={delete_action.id}: {e}",
+                    level="warning",
+                )
+                if self._advance_cleanup_tracking(delete_action.id, MemoryExpiries):
+                    self.log(
+                        f"removed lifecycle tracking after delete failures: {delete_action.id[:8]}...",
+                        level="warning",
+                    )
+                else:
+                    self.log(
+                        f"retained lifecycle tracking after delete failure: {delete_action.id[:8]}...",
+                        level="warning",
+                    )
+                return False
+
             self.log(f"deleted memory. id={delete_action.id}")
+            MemoryExpiries.delete_by_mem_id(delete_action.id)
             return True
 
         if action_name == "update":
@@ -1941,6 +2261,12 @@ class Filter:
                 form_data=MemoryUpdateModel(content=update_action.content),
                 user=user,
             )
+            existing_expiry = MemoryExpiries.get_by_mem_id(update_action.id)
+            if existing_expiry is not None:
+                MemoryExpiries.update_expired_at(
+                    update_action.id,
+                    int(getattr(existing_expiry, "expired_at", 0) or 0),
+                )
             self.log(f"updated memory. id={update_action.id}")
             return True
 
