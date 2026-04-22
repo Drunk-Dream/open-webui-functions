@@ -28,21 +28,49 @@ File Structure:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import sessionmaker
 
-from open_webui.internal.db import get_db
+from open_webui.internal.db import engine
 from open_webui.models.chats import Chats
 from open_webui.models.users import Users
 
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 EmitterType = Callable[[object], Awaitable[None]] | None
+
+
+class ChatListLike(Protocol):
+    items: list[object]
+
+
+async def _await_if_needed(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+@asynccontextmanager
+async def _get_open_webui_db_context():
+    try:
+        from open_webui.internal.db import get_async_db_context
+    except ImportError:
+        session_factory = sessionmaker(bind=engine)
+        session = session_factory()
+        try:
+            yield session
+        finally:
+            session.close()
+    else:
+        async with get_async_db_context() as db:
+            yield db
 
 
 async def emit_status(
@@ -196,6 +224,18 @@ class Filter:
 
         return list(selected.values())
 
+    async def _load_user(self, user_id: str) -> object | None:
+        return await _await_if_needed(Users.get_user_by_id(user_id))
+
+    async def _load_user_chats(self, user_id: str) -> ChatListLike:
+        response = await _await_if_needed(Chats.get_chats_by_user_id(user_id))
+        return cast(ChatListLike, response)
+
+    async def _delete_chat_by_id(self, chat_id: str, user_id: str) -> bool:
+        async with _get_open_webui_db_context() as db:
+            result = Chats.delete_chat_by_id_and_user_id(chat_id, user_id, db=db)
+            return bool(await _await_if_needed(result))
+
     async def _cleanup_chats(
         self,
         chats: Iterable[object],
@@ -220,23 +260,16 @@ class Filter:
             level="info",
         )
 
-        with get_db() as db:
-            for chat in candidates:
-                chat_id = cast(str, getattr(chat, "id"))
-                try:
-                    result = Chats.delete_chat_by_id_and_user_id(
-                        chat_id, user_id, db=db
-                    )
-                    if inspect.isawaitable(result):
-                        success = await cast(Awaitable[bool], result)
-                    else:
-                        success = bool(result)
-                    if not success:
-                        self.log(f"failed to delete chat {chat_id}", level="warning")
-                        continue
-                    deleted_chats.append(chat)
-                except Exception as e:
-                    self.log(f"failed to delete chat {chat_id}: {e}", level="error")
+        for chat in candidates:
+            chat_id = cast(str, getattr(chat, "id"))
+            try:
+                success = await self._delete_chat_by_id(chat_id=chat_id, user_id=user_id)
+                if not success:
+                    self.log(f"failed to delete chat {chat_id}", level="warning")
+                    continue
+                deleted_chats.append(chat)
+            except Exception as e:
+                self.log(f"failed to delete chat {chat_id}: {e}", level="error")
 
         self.log(
             f"cleanup completed for user {user_id}: deleted {len(deleted_chats)} of {len(candidates)} candidate chats",
@@ -272,7 +305,7 @@ class Filter:
             self.log("temporary chat, skipping", level="info")
             return body
 
-        user = Users.get_user_by_id(str(__user__["id"]))
+        user = await self._load_user(str(__user__["id"]))
         if user is None:
             raise ValueError("user not found")
 
@@ -288,7 +321,7 @@ class Filter:
             self.log("component was disabled by user, skipping", level="info")
             return body
 
-        chats_response = Chats.get_chats_by_user_id(user.id)
+        chats_response = await self._load_user_chats(cast(str, getattr(user, "id")))
         chats = chats_response.items
 
         _ = await self._cleanup_chats(

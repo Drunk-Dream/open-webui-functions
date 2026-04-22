@@ -284,3 +284,57 @@ async def test_invalid_updated_at_skipped_with_warning(mock_user, mock_emitter):
     assert CHAT_OLD_2 in _ids(candidates)
     mock_log.assert_called()
     assert any("warning" in str(call) for call in mock_log.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_outlet_supports_async_user_and_chat_loaders(mock_emitter):
+    filter_instance = _build_filter(max_idle_days=30, max_retained_chats=5)
+    filter_instance.user_valves.show_status = False
+
+    async_user = SimpleNamespace(id="test-user-123")
+    chats_response = SimpleNamespace(items=[])
+    body = {"chat_id": CHAT_ACTIVE, "messages": [{"role": "user", "content": "hello"}]}
+
+    with (
+        patch.object(
+            auto_chat_cleanup_module.Users,
+            "get_user_by_id",
+            new=AsyncMock(return_value=async_user),
+        ),
+        patch.object(
+            auto_chat_cleanup_module.Chats,
+            "get_chats_by_user_id",
+            new=AsyncMock(return_value=chats_response),
+        ),
+        patch.object(filter_instance, "_cleanup_chats", new=AsyncMock(return_value=[])) as mock_cleanup,
+    ):
+        result = await filter_instance.outlet(
+            body=body,
+            __event_emitter__=mock_emitter,
+            __user__={"id": async_user.id, "valves": {"enabled": True, "show_status": False}},
+        )
+
+    assert result is body
+    mock_cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_chats_supports_async_delete_api(mock_user, mock_emitter):
+    filter_instance = _build_filter(max_idle_days=30, max_retained_chats=0)
+    filter_instance.user_valves.show_status = False
+    chats = [make_chat(id=CHAT_OLD_1, updated_at=FIXED_NOW - 31 * DAY_SECONDS)]
+
+    with patch.object(
+        auto_chat_cleanup_module.Chats,
+        "delete_chat_by_id_and_user_id",
+        new=AsyncMock(return_value=True),
+    ):
+        deleted = await filter_instance._cleanup_chats(
+            chats=chats,
+            user=mock_user,
+            emitter=mock_emitter,
+            current_chat_id=CHAT_ACTIVE,
+            now_ts=FIXED_NOW,
+        )
+
+    assert _ids(deleted) == [CHAT_OLD_1]
