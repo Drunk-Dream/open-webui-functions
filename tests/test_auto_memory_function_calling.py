@@ -34,6 +34,7 @@ from auto_memory import (
     Memory,
     MemoryUpdateAction,
     MemoryExpiryTable,
+    _extract_text_from_message_content,
     build_memory_action_tools,
 )
 
@@ -826,6 +827,102 @@ def test_inject_memory_context_replaces_previous_memory_block():
     ]
     assert len(memory_blocks) == 1
     assert "new context" in memory_blocks[0]["content"]
+
+
+def test_extract_text_from_message_content_supports_open_webui_segments():
+    content = [
+        {"type": "text", "text": "hello"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        {"content": "world"},
+    ]
+
+    assert _extract_text_from_message_content(content) == "hello\nworld"
+
+
+def test_build_memory_query_supports_list_content_messages():
+    filter_instance = Filter()
+    messages = [
+        {"role": "assistant", "content": "Earlier assistant context"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Please remember"},
+                {"type": "text", "text": "I like oolong tea"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Sure, I can do that."}],
+        },
+    ]
+
+    query = filter_instance.build_memory_query(messages)
+
+    assert "User: Please remember\nI like oolong tea" in query
+    assert "Assistant: Sure, I can do that." in query
+
+
+def test_messages_to_string_supports_list_content_messages():
+    filter_instance = Filter()
+    filter_instance.user_valves = filter_instance.UserValves()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first line"},
+                {"type": "text", "text": "second line"},
+            ],
+        }
+    ]
+
+    stringified = filter_instance.messages_to_string(messages)
+
+    assert "first line\nsecond line" in stringified
+
+
+def test_inlet_injects_related_memories_with_list_content_messages(mock_emitter):
+    filter_instance = Filter()
+    original_user_content = [
+        {"type": "text", "text": "remember this"},
+        {"type": "text", "text": "I prefer tea"},
+    ]
+    memory = Memory(
+        mem_id="mem-103",
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        update_at=datetime(2026, 1, 1, 12, 0, 0),
+        content="User prefers tea over coffee",
+        similarity_score=0.89,
+    )
+    body = cast(
+        dict[str, object],
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": original_user_content,
+                }
+            ],
+        },
+    )
+
+    with (
+        patch("auto_memory.Users.get_user_by_id") as mock_get_user,
+        patch(
+            "auto_memory._run_async_in_thread",
+            side_effect=lambda coro: (coro.close(), [memory])[1],
+        ),
+    ):
+        mock_get_user.return_value = MagicMock(id="user-1")
+        updated = filter_instance.inlet(
+            body=body,
+            __event_emitter__=mock_emitter,
+            __user__={"id": "user-1"},
+        )
+
+    messages = cast(list[dict[str, Any]], updated["messages"])
+    assert messages[0]["role"] == "system"
+    assert cast(str, messages[0]["content"]).startswith(INLET_MEMORY_CONTEXT_PREFIX)
+    assert messages[1]["content"] == original_user_content
 
 
 @pytest.mark.asyncio

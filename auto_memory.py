@@ -5,8 +5,8 @@ description: automatically identify and store valuable information from chats as
 author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
-version: 1.4.10
-required_open_webui_version: >= 0.8.1
+version: 1.4.12
+required_open_webui_version: >= 0.9.0
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
 
 Forked from:
@@ -15,6 +15,8 @@ Forked from:
   Original Funding: https://ko-fi.com/nokodo
 
 Compatibility Note:
+- Version 1.4.12: Removed remaining runtime Chinese status strings to avoid encoding-related module load failures in environments that mishandle source text
+- Version 1.4.11: Added compatibility for list-based message content in inlet and memory planning, fixing memory context injection failures on multimodal Open WebUI messages
 - Version 1.4.10: Replaced remaining Chinese status text with English and refreshed the plugin version metadata
 - Version 1.4.9: Completed behavior-preserving single-file refactor, restored import-time lifecycle column bootstrap, and aligned hard-cap compatibility in boost semantics
 - Version 1.4.7: Optimized emit_status messages for mobile display by shortening each status text and splitting long updates into multiple emits
@@ -204,6 +206,8 @@ ACTION_ORDER: tuple[Literal["delete", "update", "add"], ...] = (
     "update",
     "add",
 )
+
+MessageContent = str | list[dict[str, Any]]
 
 # ============================================================================
 # 3. SYSTEM PROMPTS (Business Rules)
@@ -584,6 +588,37 @@ def _get_timestamp_field(source: Any, *field_names: str) -> Any | None:
             return value
 
     return None
+
+
+def _extract_text_from_message_content(content: MessageContent | Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                text_parts.append(item)
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+            continue
+
+        nested_text = item.get("content")
+        if isinstance(nested_text, str) and nested_text:
+            text_parts.append(nested_text)
+
+    return "\n".join(text_parts)
 
 
 def searchresults_to_memories(results: SearchResult) -> list[Memory]:
@@ -1712,10 +1747,11 @@ class Filter:
         index: int,
         message: dict[str, Any],
     ) -> str:
+        content_text = _extract_text_from_message_content(message.get("content", ""))
         return STRINGIFIED_MESSAGE_TEMPLATE.format(
             index=index,
             role=message.get("role", "user"),
-            content=message.get("content", ""),
+            content=content_text,
         )
 
     def _find_last_message_by_role(
@@ -1726,7 +1762,9 @@ class Filter:
         for idx in range(len(messages) - 1, -1, -1):
             message = messages[idx]
             if message.get("role") == role:
-                return idx, message.get("content", "")
+                return idx, _extract_text_from_message_content(
+                    message.get("content", "")
+                )
         return None, None
 
     def _append_user_query_context(
@@ -1738,7 +1776,9 @@ class Filter:
         query_parts: list[str],
     ) -> None:
         if last_user_idx + 1 < len(messages):
-            last_assistant_msg = messages[last_user_idx + 1].get("content", "")
+            last_assistant_msg = _extract_text_from_message_content(
+                messages[last_user_idx + 1].get("content", "")
+            )
             if last_assistant_msg:
                 query_parts.append(f"Assistant: {last_assistant_msg}")
 
@@ -1746,7 +1786,9 @@ class Filter:
 
         if include_extra_context and last_user_idx > 0:
             previous_message = messages[last_user_idx - 1]
-            previous_assistant_msg = previous_message.get("content", "")
+            previous_assistant_msg = _extract_text_from_message_content(
+                previous_message.get("content", "")
+            )
             if previous_message.get("role") == "assistant" and previous_assistant_msg:
                 query_parts.append(f"Assistant: {previous_assistant_msg}")
 
@@ -2072,19 +2114,19 @@ class Filter:
 
         if boost_stats["boosted"] > 0:
             await emit_status(
-                f"延长{boost_stats['boosted']}个记忆",
+                f"Extended {boost_stats['boosted']} memories",
                 emitter=emitter,
                 status="complete",
             )
         if boost_stats["created"] > 0:
             await emit_status(
-                f"初始化{boost_stats['created']}个记忆",
+                f"Initialized {boost_stats['created']} memories",
                 emitter=emitter,
                 status="complete",
             )
         if deleted_count > 0:
             await emit_status(
-                f"清理{deleted_count}个记忆",
+                f"Cleaned up {deleted_count} memories",
                 emitter=emitter,
                 status="complete",
             )
@@ -2092,7 +2134,7 @@ class Filter:
     def _find_latest_user_message(self, messages: list[dict[str, Any]]) -> str:
         return next(
             (
-                cast(str, message.get("content", ""))
+                _extract_text_from_message_content(message.get("content", ""))
                 for message in reversed(messages)
                 if message.get("role") == "user"
             ),
@@ -2343,12 +2385,12 @@ class Filter:
         return f"{action_name} memory {cast(Any, action).id}"
 
     def _memory_action_status_labels(self) -> dict[str, str]:
-        return {"delete": "删除", "update": "更新", "add": "新增"}
+        return {"delete": "Deleted", "update": "Updated", "add": "Added"}
 
     def _build_memory_action_summary_parts(self, counts: dict[str, int]) -> list[str]:
         status_labels = self._memory_action_status_labels()
         return [
-            f"{status_labels[action_name]}{counts[action_name]}个记忆"
+            f"{status_labels[action_name]} {counts[action_name]} memories"
             for action_name in ACTION_ORDER
             if counts[action_name] > 0
         ]
