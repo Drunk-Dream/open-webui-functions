@@ -6,7 +6,7 @@ author_email: dongmh3@outlook.com
 author_url: https://github.com/Drunk-Dream
 repository_url: https://github.com/Drunk-Dream/open-webui-functions
 version: 1.0.1
-required_open_webui_version: >= 0.8.1
+required_open_webui_version: >= 0.9.0
 license: MIT
 
 Compatibility Note:
